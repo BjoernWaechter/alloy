@@ -60,13 +60,13 @@ var (
 )
 
 type Arguments struct {
-	DataSourceName                alloytypes.Secret   `alloy:"data_source_name,attr"`
-	ForwardTo                     []loki.LogsReceiver `alloy:"forward_to,attr"`
-	Targets                       []discovery.Target  `alloy:"targets,attr,optional"`
-	EnableCollectors              []string            `alloy:"enable_collectors,attr,optional"`
-	DisableCollectors             []string            `alloy:"disable_collectors,attr,optional"`
-	ExcludeSchemas                []string            `alloy:"exclude_schemas,attr,optional"`
-	AllowUpdatePerfSchemaSettings bool                `alloy:"allow_update_performance_schema_settings,attr,optional"`
+	DataSourceName                alloytypes.Secret  `alloy:"data_source_name,attr"`
+	ForwardTo                     []loki.Consumer    `alloy:"forward_to,attr"`
+	Targets                       []discovery.Target `alloy:"targets,attr,optional"`
+	EnableCollectors              []string           `alloy:"enable_collectors,attr,optional"`
+	DisableCollectors             []string           `alloy:"disable_collectors,attr,optional"`
+	ExcludeSchemas                []string           `alloy:"exclude_schemas,attr,optional"`
+	AllowUpdatePerfSchemaSettings bool               `alloy:"allow_update_performance_schema_settings,attr,optional"`
 
 	CloudProvider           *CloudProvider               `alloy:"cloud_provider,block,optional"`
 	SetupConsumersArguments SetupConsumersArguments      `alloy:"setup_consumers,block,optional"`
@@ -262,7 +262,7 @@ type Component struct {
 	opts              component.Options
 	args              Arguments
 	handler           loki.LogsReceiver
-	fanout            *loki.Fanout
+	fanout            *loki.FanoutConsumer
 	mut               sync.RWMutex
 	registry          *prometheus.Registry
 	baseTarget        discovery.Target
@@ -282,7 +282,7 @@ func new(opts component.Options, args Arguments, openFn func(driverName, dataSou
 	c := &Component{
 		opts:      opts,
 		args:      args,
-		fanout:    loki.NewFanout(args.ForwardTo),
+		fanout:    loki.NewFanoutConsumer(args.ForwardTo),
 		handler:   loki.NewLogsReceiver(),
 		registry:  prometheus.NewRegistry(),
 		healthErr: atomic.NewString(""),
@@ -312,7 +312,7 @@ func (c *Component) Run(ctx context.Context) error {
 	defer func() {
 		level.Info(c.opts.Logger).Log("msg", name+" component shutting down, stopping collectors")
 
-		loki.Drain(c.handler, c.fanout, loki.DefaultDrainTimeout, func() {
+		loki.Drain2(c.handler, c.fanout, loki.DefaultDrainTimeout, func() {
 			c.mut.Lock()
 			defer c.mut.Unlock()
 
@@ -330,7 +330,7 @@ func (c *Component) Run(ctx context.Context) error {
 		consumeCtx, cancel = context.WithCancel(context.Background())
 	)
 
-	wg.Go(func() { loki.Consume(consumeCtx, c.handler, c.fanout) })
+	wg.Go(func() { loki.Consume2(consumeCtx, c.handler, c.fanout) })
 
 	wg.Go(func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -391,7 +391,7 @@ func (c *Component) Update(args component.Arguments) error {
 	defer c.mut.Unlock()
 
 	c.args = args.(Arguments)
-	c.fanout.UpdateChildren(c.args.ForwardTo)
+	c.fanout.Update(c.args.ForwardTo)
 
 	if err := c.connectAndStartCollectors(context.Background()); err != nil {
 		c.reportError("failed to connect", err)
