@@ -10,7 +10,6 @@ package convert
 
 import (
 	"context"
-	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/grafana/alloy/internal/component/common/loki"
@@ -27,15 +26,13 @@ type Converter struct {
 	log     log.Logger
 	metrics *metrics
 
-	mut  sync.RWMutex
-	next []loki.LogsReceiver // Location to write converted logs.
+	next *loki.FanoutConsumer // Location to write converted logs.
 }
 
 var _ consumer.Logs = (*Converter)(nil)
 
-// New returns a new Converter. Converted logs are passed to the provided list
-// of LogsReceivers.
-func New(l log.Logger, r prometheus.Registerer, next []loki.LogsReceiver) *Converter {
+// New returns a new Converter. Converted logs are passed to next.
+func New(l log.Logger, r prometheus.Registerer, next *loki.FanoutConsumer) *Converter {
 	if l == nil {
 		l = log.NewNopLogger()
 	}
@@ -52,7 +49,7 @@ func (conv *Converter) Capabilities() consumer.Capabilities {
 
 // ConsumeLogs converts the provided OpenTelemetry Collector-formatted logs
 // into Loki-compatible entries. Each call to ConsumeLogs will forward
-// converted entries to the list of channels in the `next` field.
+// converted entries to `next`.
 // This is reusing the logic from the OpenTelemetry Collector "contrib"
 // distribution and its LogsToLokiRequests function.
 func (conv *Converter) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
@@ -87,24 +84,16 @@ func (conv *Converter) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
 	}
 
 	for _, entry := range entries {
-		conv.mut.RLock()
-		for _, receiver := range conv.next {
-			select {
-			case <-ctx.Done():
-				return nil
-			case receiver.Chan() <- entry:
-				// no-op, send the entry along
-			}
+		// NOTE: For now we stop on first error. Once we change to support batching we will batch
+		// all converted logs and send it once. See https://github.com/grafana/alloy/issues/4953
+		if err := conv.next.ConsumeEntry(ctx, entry); err != nil {
+			return err
 		}
-		conv.mut.RUnlock()
 	}
 	return nil
 }
 
 // UpdateFanout sets the locations the converter forwards log entries to.
-func (conv *Converter) UpdateFanout(fanout []loki.LogsReceiver) {
-	conv.mut.Lock()
-	defer conv.mut.Unlock()
-
-	conv.next = fanout
+func (conv *Converter) UpdateFanout(consumers []loki.Consumer) {
+	conv.next.Update(consumers)
 }
