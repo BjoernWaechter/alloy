@@ -15,7 +15,7 @@ type Options struct {
 	Level  Level  `alloy:"level,attr,optional"`
 	Format Format `alloy:"format,attr,optional"`
 
-	WriteTo []loki.LogsReceiver `alloy:"write_to,attr,optional"`
+	WriteTo []loki.Consumer `alloy:"write_to,attr,optional"`
 }
 
 // DefaultOptions holds defaults for creating a Logger.
