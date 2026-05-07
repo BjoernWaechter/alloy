@@ -477,6 +477,13 @@ func (c *QuerySamples) emitAndDeleteSample(key SampleKey) {
 	if state.EndAt.Valid {
 		ts = state.EndAt.Time.UnixNano()
 	}
+	// Prefer query_start so the sample's plotted point aligns with the
+	// application trace span's start time (which is what trace linkage
+	// navigates to). The query_time label still encodes the duration, so
+	// the frontend can render it as a bar from query_start onward.
+	if state.LastRow.QueryStart.Valid {
+		ts = state.LastRow.QueryStart.Time.UnixNano()
+	}
 	c.entryHandler.Chan() <- database_observability.BuildLokiEntryWithTimestamp(
 		logging.LevelInfo,
 		OP_QUERY_SAMPLE,

@@ -48,6 +48,7 @@ SELECT
 	statements.END_EVENT_ID,
 	statements.DIGEST,
 	statements.SQL_TEXT,
+	statements.TIMER_START,
 	statements.TIMER_END,
 	statements.TIMER_WAIT,
 	statements.ROWS_EXAMINED,
@@ -308,6 +309,7 @@ func (c *QuerySamples) fetchQuerySamples(ctx context.Context) error {
 			SQLText             sql.NullString
 
 			// sample time
+			TimerStartPicoseconds  sql.NullFloat64
 			TimerEndPicoseconds    sql.NullFloat64
 			TimestampMilliseconds  float64
 			ElapsedTimePicoseconds sql.NullFloat64
@@ -343,6 +345,7 @@ func (c *QuerySamples) fetchQuerySamples(ctx context.Context) error {
 			&row.StatementEndEventID,
 			&row.Digest,
 			&row.SQLText,
+			&row.TimerStartPicoseconds,
 			&row.TimerEndPicoseconds,
 			&row.ElapsedTimePicoseconds,
 			&row.RowsExamined,
@@ -379,7 +382,13 @@ func (c *QuerySamples) fetchQuerySamples(ctx context.Context) error {
 		}
 
 		serverStartTime := now - uptime
-		row.TimestampMilliseconds = calculateWallTime(serverStartTime, row.TimerEndPicoseconds.Float64, uptime)
+		// Stamp the sample at the query's start time so the timestamp aligns with the
+		// application trace span's start, which is what the DB O11y app's trace linkage
+		// navigates to. TIMER_END is passed as the overflow-window anchor (the bookmark
+		// WHERE clause guarantees TIMER_END is in the current window); TIMER_START may
+		// be from the previous window for queries that bridged a 213-day overflow, and
+		// calculateWallTime detects that via timer > anchor.
+		row.TimestampMilliseconds = calculateWallTime(serverStartTime, row.TimerStartPicoseconds.Float64, row.TimerEndPicoseconds.Float64, uptime)
 		cpuTime := picosecondsToMilliseconds(row.CPUTime)
 		elapsedTime := picosecondsToMilliseconds(row.ElapsedTimePicoseconds.Float64)
 		traceParent := tryExtractTraceParent(row.SQLText.String)

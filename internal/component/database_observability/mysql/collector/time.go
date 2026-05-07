@@ -16,9 +16,20 @@ const (
 // Since this value can overflow after approximately ~213 days (column type of bigint unsigned),
 // this function accounts for overflows by calculating the number of previous overflows and
 // compensating accordingly. Returns the timestamp in milliseconds when the event occurred.
-func calculateWallTime(serverStartTimeSeconds, timerPicoseconds, uptimeSeconds float64) float64 {
+//
+// anchorPicoseconds is a timer value known to be in the *current* overflow window,
+// used to detect when timerPicoseconds belongs to the previous overflow window
+// (e.g. a TIMER_START whose statement bridged the boundary). For events whose
+// own timer is already in the current window, pass anchorPicoseconds == timerPicoseconds.
+func calculateWallTime(serverStartTimeSeconds, timerPicoseconds, anchorPicoseconds, uptimeSeconds float64) float64 {
 	// Knowing the number of overflows that occurred, we can calculate how much overflow time to compensate
 	previousOverflows := calculateNumberOfOverflows(uptimeSeconds)
+	// If timerPicoseconds is greater than the anchor (which is in the current
+	// overflow window), the timer hasn't been reset yet — it's a stale value
+	// from the previous window, so subtract one window's worth of overflow.
+	if timerPicoseconds > anchorPicoseconds {
+		previousOverflows--
+	}
 	overflowTime := float64(previousOverflows) * picosecondsOverflowInSeconds
 
 	// We then add this overflow compensation to the server start time, and also add the timer value (remember this is counted from server start).
