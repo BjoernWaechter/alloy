@@ -379,9 +379,16 @@ func (c *QuerySamples) fetchQuerySamples(ctx context.Context) error {
 		}
 
 		serverStartTime := now - uptime
-		row.TimestampMilliseconds = calculateWallTime(serverStartTime, row.TimerEndPicoseconds.Float64, uptime)
-		cpuTime := picosecondsToMilliseconds(row.CPUTime)
+		// Stamp the sample at the query's start time (TIMER_END - TIMER_WAIT) so the
+		// timestamp aligns with the application trace span's start, which is what the
+		// DB O11y app's trace linkage navigates to. Anchoring the wall-time calculation
+		// on TIMER_END (which the bookmark guarantees is in the current overflow window)
+		// and subtracting elapsed time avoids the overflow-boundary edge case that would
+		// arise from feeding TIMER_START directly into calculateWallTime.
+		endMilliseconds := calculateWallTime(serverStartTime, row.TimerEndPicoseconds.Float64, uptime)
 		elapsedTime := picosecondsToMilliseconds(row.ElapsedTimePicoseconds.Float64)
+		row.TimestampMilliseconds = endMilliseconds - elapsedTime
+		cpuTime := picosecondsToMilliseconds(row.CPUTime)
 		traceParent := tryExtractTraceParent(row.SQLText.String)
 
 		logMessage := fmt.Sprintf(
