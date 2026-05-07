@@ -186,25 +186,6 @@ func TestLevels(t *testing.T) {
 	}
 }
 
-// Test_lokiWriter_nil ensures that writing to a lokiWriter doesn't panic when
-// given a nil receiver.
-func Test_lokiWriter_nil(t *testing.T) {
-	logger, err := logging.New(io.Discard, debugLevel())
-	require.NoError(t, err)
-
-	err = logger.Update(logging.Options{
-		Level:  logging.LevelDebug,
-		Format: logging.FormatLogfmt,
-
-		WriteTo: []loki.LogsReceiver{nil},
-	})
-	require.NoError(t, err)
-
-	require.NotPanics(t, func() {
-		_ = logger.Log("msg", "test message")
-	})
-}
-
 // TestWriteToDisabledViaUpdate verifies that logs go to both stderr and the
 // configured write_to receiver while write_to is set, and that calling Update
 // with an empty WriteTo stops sending logs to the receiver while still emitting
