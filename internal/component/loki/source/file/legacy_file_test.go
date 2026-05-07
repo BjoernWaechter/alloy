@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
@@ -55,7 +56,7 @@ log 5
 	ctrl, err := componenttest.NewControllerFromID(logging.NewNop(), "loki.source.file")
 	require.NoError(t, err)
 
-	rec := loki.NewLogsReceiver()
+	collector := loki.NewCollectingConsumer()
 
 	go func() {
 		err := ctrl.Run(ctx, Arguments{
@@ -64,7 +65,7 @@ log 5
 				"foo":      "bar",
 			})},
 			LegacyPositionsFile: legacyPositionFilename,
-			ForwardTo:           []loki.LogsReceiver{rec},
+			ForwardTo:           []loki.Consumer{collector},
 			FileMatch: FileMatch{
 				SyncPeriod: 10 * time.Second,
 			},
@@ -72,12 +73,14 @@ log 5
 		require.NoError(t, err)
 	}()
 
-	require.NoError(t, ctrl.WaitRunning(10*time.Second))
+	require.NoError(t, ctrl.WaitRunning(time.Minute))
 
-	entry := <-rec.Chan()
-	require.Equal(t, "log 3", entry.Line)
-	entry = <-rec.Chan()
-	require.Equal(t, "log 4", entry.Line)
-	entry = <-rec.Chan()
-	require.Equal(t, "log 5", entry.Line)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		require.Len(c, collector.Entries(), 3)
+	}, 5*time.Second, 100*time.Millisecond)
+
+	got := collector.Entries()
+	require.Equal(t, "log 3", got[0].Line)
+	require.Equal(t, "log 4", got[1].Line)
+	require.Equal(t, "log 5", got[2].Line)
 }
