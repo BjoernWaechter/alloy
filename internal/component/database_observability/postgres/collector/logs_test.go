@@ -371,7 +371,6 @@ func TestLogsCollector_EmptyUserAndDatabase(t *testing.T) {
 }
 
 func TestLogsCollector_StartStop(t *testing.T) {
-
 	collector, err := NewLogs(LogsArguments{
 		Receiver: loki.NewLogsReceiver(),
 		Logger:   log.NewNopLogger(),
