@@ -192,7 +192,8 @@ func TestLevels(t *testing.T) {
 // to stderr.
 func TestWriteToDisabledViaUpdate(t *testing.T) {
 	var buf safeBuffer
-	receiver := loki.NewLogsReceiver(loki.WithChannel(make(chan loki.Entry, 16)))
+
+	collector := loki.NewCollectingConsumer()
 
 	logger, err := logging.New(&buf, debugLevel())
 	require.NoError(t, err)
@@ -200,8 +201,12 @@ func TestWriteToDisabledViaUpdate(t *testing.T) {
 	require.NoError(t, logger.Update(logging.Options{
 		Level:   logging.LevelDebug,
 		Format:  logging.FormatLogfmt,
-		WriteTo: []loki.LogsReceiver{receiver},
+		WriteTo: []loki.Consumer{collector},
 	}))
+
+	// We need some time to make sure that lokiWriter have started
+	// it's read loop
+	time.Sleep(100 * time.Millisecond)
 
 	require.NoError(t, logger.Log("msg", "with-write-to"))
 
@@ -209,12 +214,11 @@ func TestWriteToDisabledViaUpdate(t *testing.T) {
 		return strings.Contains(buf.String(), "with-write-to")
 	}, time.Second, 10*time.Millisecond, "stderr did not receive log while write_to was enabled")
 
-	select {
-	case entry := <-receiver.Chan():
-		require.Contains(t, entry.Line, "with-write-to")
-	case <-time.After(time.Second):
-		t.Fatal("write_to receiver did not receive log while write_to was enabled")
-	}
+	require.Eventually(t, func() bool {
+		return len(collector.Entries()) == 1
+	}, time.Second, 10*time.Millisecond, "consumer did not receive log entry")
+
+	collector.Reset()
 
 	require.NoError(t, logger.Update(logging.Options{
 		Level:  logging.LevelDebug,
@@ -227,13 +231,12 @@ func TestWriteToDisabledViaUpdate(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return strings.Contains(buf.String(), "without-write-to")
 	}, time.Second, 10*time.Millisecond, "stderr did not receive log after write_to was disabled")
+
 	require.Greater(t, len(buf.String()), len(beforeLen))
 
-	select {
-	case entry := <-receiver.Chan():
-		t.Fatalf("write_to receiver got log %q after write_to was disabled", entry.Line)
-	case <-time.After(100 * time.Millisecond):
-	}
+	require.Never(t, func() bool {
+		return len(collector.Entries()) > 0
+	}, time.Second, 10*time.Millisecond, "consumer received log after it was disabled")
 }
 
 // TestUpdateConcurrentHandle verifies that Logger.Update completes successfully
