@@ -21,7 +21,7 @@ import (
 // expected to behave. Handlers will look up whether they should be logging as
 // JSON or logfmt, and create a new inner handler if needed.
 
-type handler struct {
+type bytesHandler struct {
 	w         io.Writer
 	leveler   slog.Leveler
 	formatter formatter
@@ -44,18 +44,18 @@ type formatter interface {
 	Format() Format
 }
 
-var _ slog.Handler = (*handler)(nil)
+var _ slog.Handler = (*bytesHandler)(nil)
 
-func (h *handler) Enabled(ctx context.Context, l slog.Level) bool {
+func (h *bytesHandler) Enabled(ctx context.Context, l slog.Level) bool {
 	// Bypass the cache and check the underlying leveler directly.
 	return l >= h.leveler.Level()
 }
 
-func (h *handler) Handle(ctx context.Context, r slog.Record) error {
+func (h *bytesHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.buildHandler().Handle(ctx, r)
 }
 
-func (h *handler) buildHandler() slog.Handler {
+func (h *bytesHandler) buildHandler() slog.Handler {
 	// Get the expected format for the duration of this call. It's possible that
 	// this will be stale by the time the call returns, but it will be correct on
 	// the next call.
@@ -107,14 +107,14 @@ func (h *handler) buildHandler() slog.Handler {
 	return newHandler
 }
 
-func (h *handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+func (h *bytesHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	newNest := make([]nesting, 0, len(h.nested)+1)
 	newNest = append(newNest, h.nested...)
 	newNest = append(newNest, nesting{
 		attrs: attrs,
 	})
 
-	return &handler{
+	return &bytesHandler{
 		w:         h.w,
 		leveler:   h.leveler,
 		formatter: h.formatter,
@@ -124,13 +124,13 @@ func (h *handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
-func (h *handler) WithGroup(name string) slog.Handler {
+func (h *bytesHandler) WithGroup(name string) slog.Handler {
 	newNest := make([]nesting, 0, len(h.nested)+1)
 	newNest = append(newNest, h.nested...)
 	newNest = append(newNest, nesting{
 		group: name,
 	})
-	return &handler{
+	return &bytesHandler{
 		w:         h.w,
 		leveler:   h.leveler,
 		formatter: h.formatter,

@@ -32,11 +32,17 @@ type Logger struct {
 	level        *slog.LevelVar       // Current configured level.
 	format       *formatVar           // Current configured format.
 	writer       *writerVar           // Current configured multiwriter (inner + write_to).
-	handler      *handler             // Handler that writes to writer (stderr + write_to).
+	bytesHandler *bytesHandler        // slog.Handler that formats records to bytes and writes through writer.
 	deferredSlog *deferredSlogHandler // Buffers slog output until config is loaded, then delegates to handler.
 
 	windowsEventLogHandler *windowsEventLogHandler // When destination is windows_event_log (Windows only).
 	eventLogOpener         eventlog.EventLogOpener // Opens the Windows event log; set in NewDeferred, overridable via SetEventLogOpener for tests.
+
+	// handler is the slog.Handler dispatched to by both the gokit and slog
+	// paths. It is l.bytesHandler by default and a
+	// fanoutHandler{windowsEventLogHandler, bytesHandler} when the Windows
+	// Event Log destination is active.
+	handler slog.Handler
 }
 
 var _ EnabledAware = (*Logger)(nil)
@@ -87,7 +93,7 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 		level:  &leveler,
 		format: &format,
 		writer: &writer,
-		handler: &handler{
+		bytesHandler: &bytesHandler{
 			w:         &writer,
 			leveler:   &leveler,
 			formatter: &format,
@@ -95,6 +101,7 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 		},
 		eventLogOpener: eventlog.GetEventLogOpener(),
 	}
+	l.handler = l.bytesHandler
 	l.deferredSlog = newDeferredHandler(l)
 
 	return l, nil
@@ -167,6 +174,12 @@ func (l *Logger) Update(o Options) error {
 	if len(o.WriteTo) > 0 {
 		l.writer.SetLokiWriter(&lokiWriter{o.WriteTo})
 	}
+
+	if l.windowsEventLogHandler != nil {
+		l.handler = fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}
+	} else {
+		l.handler = l.bytesHandler
+	}
 	l.bufferMut.Unlock()
 
 	// Build deferred handlers outside bufferMut to avoid a deadlock: concurrent
@@ -186,21 +199,14 @@ func (l *Logger) Update(o Options) error {
 	buffer := l.buffer
 	l.buffer = nil
 
-	// Replay buffered logs
+	// Replay buffered logs. The bufferedItem's handler (for slog records) was
+	// rebuilt above via deferredSlog.buildHandlers and now points at l.handler,
+	// which fans out to the event log + bytes handler when both are needed.
 	for _, bufferedLogChunk := range buffer {
 		if len(bufferedLogChunk.kvps) > 0 {
-			if l.windowsEventLogHandler != nil {
-				slogadapter.GoKit(l.windowsEventLogHandler).Log(bufferedLogChunk.kvps...)
-			}
 			slogadapter.GoKit(l.handler).Log(bufferedLogChunk.kvps...)
-		} else {
-			if l.windowsEventLogHandler != nil && l.windowsEventLogHandler.Enabled(context.Background(), bufferedLogChunk.record.Level) {
-				_ = l.windowsEventLogHandler.Handle(context.Background(), bufferedLogChunk.record)
-			}
-			// We can now check whether our buffered log is at the right level.
-			if bufferedLogChunk.handler.Enabled(context.Background(), bufferedLogChunk.record.Level) {
-				_ = bufferedLogChunk.handler.Handle(context.Background(), bufferedLogChunk.record)
-			}
+		} else if bufferedLogChunk.handler.Enabled(context.Background(), bufferedLogChunk.record.Level) {
+			_ = bufferedLogChunk.handler.Handle(context.Background(), bufferedLogChunk.record)
 		}
 	}
 
@@ -235,14 +241,7 @@ func (l *Logger) Log(kvps ...any) error {
 
 	// NOTE(rfratto): slogadapter is a temporary shim while log/slog is still
 	// being adopted throughout the codebase.
-	var err error
-	if l.windowsEventLogHandler != nil {
-		err = slogadapter.GoKit(l.windowsEventLogHandler).Log(kvps...)
-	}
-	if regularErr := slogadapter.GoKit(l.handler).Log(kvps...); regularErr != nil {
-		return regularErr
-	}
-	return err
+	return slogadapter.GoKit(l.handler).Log(kvps...)
 }
 
 func (l *Logger) addRecord(r slog.Record, df *deferredSlogHandler) {
