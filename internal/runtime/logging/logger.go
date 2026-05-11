@@ -137,13 +137,17 @@ func (l *Logger) Update(o Options) error {
 	l.level.Set(slogLevel(o.Level).Level())
 	l.format.Set(o.Format)
 
-	// Handle Windows Event Log configuration
+	// Close any existing Windows Event Log handler; we'll open a fresh one
+	// below if the destination still calls for it.
+	if l.windowsEventLogHandler != nil {
+		_ = l.windowsEventLogHandler.Close()
+		l.windowsEventLogHandler = nil
+	}
+	// Configure the destination. The bytes handler always writes through
+	// l.writer, which fans bytes to innerWriter (below) and, when set,
+	// lokiWriter (write_to) — so write_to receives logs regardless of
+	// destination.
 	if o.EffectiveDestination() == LogDestinationWindowsEventLog {
-		// Close existing Windows Event Log handler if it exists
-		if l.windowsEventLogHandler != nil {
-			_ = l.windowsEventLogHandler.Close()
-		}
-
 		el, err := l.eventLogOpener("Alloy")
 		if err != nil {
 			return fmt.Errorf("failed to open Windows Event Log: %w", err)
@@ -152,33 +156,16 @@ func (l *Logger) Update(o Options) error {
 		if l.windowsEventLogHandler == nil {
 			return fmt.Errorf("failed to create Windows Event Log handler: %w", err)
 		}
-	} else {
-		// Close Windows Event Log handler if it exists and we're not using it
-		if l.windowsEventLogHandler != nil {
-			_ = l.windowsEventLogHandler.Close()
-			l.windowsEventLogHandler = nil
-		}
-	}
-
-	// Configure the writer used by the regular handler. It always writes to both
-	// innerWriter (below) and, when set, lokiWriter (write_to). So write_to receives
-	// logs regardless of destination.
-	switch o.EffectiveDestination() {
-	case LogDestinationWindowsEventLog:
-		// Handler still writes to l.writer
-		// writerVar.Write() sends to both innerWriter (stderr) and lokiWriter (write_to), so only innerWriter is disabled.
+		// Suppress innerWriter so the bytes handler only feeds write_to; the
+		// event log itself is delivered via windowsEventLogHandler.
 		l.writer.SetInnerWriter(io.Discard)
-	default:
+		l.handler = fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}
+	} else {
 		l.writer.SetInnerWriter(l.inner)
+		l.handler = l.bytesHandler
 	}
 	if len(o.WriteTo) > 0 {
 		l.writer.SetLokiWriter(&lokiWriter{o.WriteTo})
-	}
-
-	if l.windowsEventLogHandler != nil {
-		l.handler = fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}
-	} else {
-		l.handler = l.bytesHandler
 	}
 	l.bufferMut.Unlock()
 
