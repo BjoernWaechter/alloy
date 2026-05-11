@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/common/model"
@@ -41,15 +42,33 @@ type Logger struct {
 	// handler is the slog.Handler dispatched to by both the gokit and slog
 	// paths. It is l.bytesHandler by default and a
 	// fanoutHandler{windowsEventLogHandler, bytesHandler} when the Windows
-	// Event Log destination is active.
-	handler slog.Handler
+	// Event Log destination is active. Stored atomically so Log/Enabled can
+	// read it without a lock while Update reassigns it.
+	//
+	// Trade-off: a Log goroutine can load the old handler microseconds before
+	// Update swaps it in, so during a reload there is a brief window where a
+	// record may dispatch through the previous configuration — e.g. an event
+	// log → stderr reload could duplicate a record (old fanoutHandler still
+	// writes to event log while the new stderr path also writes), and an
+	// event log reload could send a record to a just-closed event log handle
+	// (which returns an error from el.Info but does not crash). Accepted
+	// because (1) config reloads are rare, (2) the worst case is a couple of
+	// duplicated or dropped records per reload, and (3) the alternative —
+	// holding bufferMut for the entire dispatch — would let a slow sink
+	// (e.g. a blocked Loki receiver) stall Update indefinitely, which is a
+	// worse failure mode.
+	handler atomic.Pointer[handlerHolder]
 }
+
+// handlerHolder wraps a slog.Handler so it can be stored in an
+// atomic.Pointer (which requires a concrete pointer type).
+type handlerHolder struct{ h slog.Handler }
 
 var _ EnabledAware = (*Logger)(nil)
 
 // Enabled implements EnabledAware interface.
 func (l *Logger) Enabled(ctx context.Context, level slog.Level) bool {
-	return l.handler.Enabled(ctx, level)
+	return l.handler.Load().h.Enabled(ctx, level)
 }
 
 // New creates a New logger with the default log level and format.
@@ -101,7 +120,7 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 		},
 		eventLogOpener: eventlog.GetEventLogOpener(),
 	}
-	l.handler = l.bytesHandler
+	l.handler.Store(&handlerHolder{h: l.bytesHandler})
 	l.deferredSlog = newDeferredHandler(l)
 
 	return l, nil
@@ -159,10 +178,10 @@ func (l *Logger) Update(o Options) error {
 		// Suppress innerWriter so the bytes handler only feeds write_to; the
 		// event log itself is delivered via windowsEventLogHandler.
 		l.writer.SetInnerWriter(io.Discard)
-		l.handler = fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}
+		l.handler.Store(&handlerHolder{h: fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}})
 	} else {
 		l.writer.SetInnerWriter(l.inner)
-		l.handler = l.bytesHandler
+		l.handler.Store(&handlerHolder{h: l.bytesHandler})
 	}
 	if len(o.WriteTo) > 0 {
 		l.writer.SetLokiWriter(&lokiWriter{o.WriteTo})
@@ -189,9 +208,10 @@ func (l *Logger) Update(o Options) error {
 	// Replay buffered logs. The bufferedItem's handler (for slog records) was
 	// rebuilt above via deferredSlog.buildHandlers and now points at l.handler,
 	// which fans out to the event log + bytes handler when both are needed.
+	h := l.handler.Load().h
 	for _, bufferedLogChunk := range buffer {
 		if len(bufferedLogChunk.kvps) > 0 {
-			slogadapter.GoKit(l.handler).Log(bufferedLogChunk.kvps...)
+			slogadapter.GoKit(h).Log(bufferedLogChunk.kvps...)
 		} else if bufferedLogChunk.handler.Enabled(context.Background(), bufferedLogChunk.record.Level) {
 			_ = bufferedLogChunk.handler.Handle(context.Background(), bufferedLogChunk.record)
 		}
@@ -210,7 +230,7 @@ func (l *Logger) RemoveTemporaryWriter() {
 
 // Log implements log.Logger.
 func (l *Logger) Log(kvps ...any) error {
-	// Buffer logs before confirming log format is configured in `logging` block
+	// Buffer logs before confirming log format is configured in `logging` block.
 	l.bufferMut.RLock()
 	if !l.hasLogFormat {
 		l.bufferMut.RUnlock()
@@ -228,7 +248,7 @@ func (l *Logger) Log(kvps ...any) error {
 
 	// NOTE(rfratto): slogadapter is a temporary shim while log/slog is still
 	// being adopted throughout the codebase.
-	return slogadapter.GoKit(l.handler).Log(kvps...)
+	return slogadapter.GoKit(l.handler.Load().h).Log(kvps...)
 }
 
 func (l *Logger) addRecord(r slog.Record, df *deferredSlogHandler) {
