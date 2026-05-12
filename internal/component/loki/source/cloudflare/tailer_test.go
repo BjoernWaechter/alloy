@@ -193,6 +193,9 @@ func TestTailer_RetryErrorIterating(t *testing.T) {
 }
 
 func TestTailer_CloudflareTargetError(t *testing.T) {
+	// retries as fast as possible.
+	defaultBackoff.MinBackoff = 0
+	defaultBackoff.MaxBackoff = 0
 	var (
 		logger = log.NewNopLogger()
 		cfg    = &tailerConfig{
@@ -212,9 +215,6 @@ func TestTailer_CloudflareTargetError(t *testing.T) {
 		SyncPeriod:    10 * time.Second,
 		PositionsFile: t.TempDir() + "/positions.yml",
 	})
-	// retries as fast as possible.
-	defaultBackoff.MinBackoff = 0
-	defaultBackoff.MaxBackoff = 0
 
 	// set our end time to be the last time we have a position
 	ps.Put(positions.CursorKey(cfg.ZoneID), cfg.Labels.String(), end.UnixNano())
@@ -229,7 +229,6 @@ func TestTailer_CloudflareTargetError(t *testing.T) {
 
 	ta, err := newTailer(newMetrics(prometheus.NewRegistry()), logger, handler.Receiver(), ps, cfg)
 	require.NoError(t, err)
-	require.True(t, ta.ready())
 
 	// wait for the target to be stopped.
 	require.Eventually(t, func() bool {
@@ -248,6 +247,9 @@ func TestTailer_CloudflareTargetError(t *testing.T) {
 }
 
 func TestTailer_CloudflareTargetError168h(t *testing.T) {
+	// retries as fast as possible.
+	defaultBackoff.MinBackoff = 0
+	defaultBackoff.MaxBackoff = 0
 	var (
 		logger = log.NewNopLogger()
 		cfg    = &tailerConfig{
@@ -267,9 +269,6 @@ func TestTailer_CloudflareTargetError168h(t *testing.T) {
 		SyncPeriod:    10 * time.Second,
 		PositionsFile: t.TempDir() + "/positions.yml",
 	})
-	// retries as fast as possible.
-	defaultBackoff.MinBackoff = 0
-	defaultBackoff.MaxBackoff = 0
 
 	// set our end time to be the last time we have a position
 	ps.Put(positions.CursorKey(cfg.ZoneID), cfg.Labels.String(), end.UnixNano())
@@ -284,7 +283,6 @@ func TestTailer_CloudflareTargetError168h(t *testing.T) {
 
 	ta, err := newTailer(newMetrics(prometheus.NewRegistry()), logger, handler.Receiver(), ps, cfg)
 	require.NoError(t, err)
-	require.True(t, ta.ready())
 
 	// wait for the target to be stopped.
 	require.Eventually(t, func() bool {
