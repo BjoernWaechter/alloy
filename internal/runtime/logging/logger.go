@@ -44,19 +44,6 @@ type Logger struct {
 	// fanoutHandler{windowsEventLogHandler, bytesHandler} when the Windows
 	// Event Log destination is active. Stored atomically so Log/Enabled can
 	// read it without a lock while Update reassigns it.
-	//
-	// Trade-off: a Log goroutine can load the old handler microseconds before
-	// Update swaps it in, so during a reload there is a brief window where a
-	// record may dispatch through the previous configuration — e.g. an event
-	// log → stderr reload could duplicate a record (old fanoutHandler still
-	// writes to event log while the new stderr path also writes), and an
-	// event log reload could send a record to a just-closed event log handle
-	// (which returns an error from el.Info but does not crash). Accepted
-	// because (1) config reloads are rare, (2) the worst case is a couple of
-	// duplicated or dropped records per reload, and (3) the alternative —
-	// holding bufferMut for the entire dispatch — would let a slow sink
-	// (e.g. a blocked Loki receiver) stall Update indefinitely, which is a
-	// worse failure mode.
 	handler atomic.Pointer[handlerHolder]
 }
 
@@ -166,13 +153,26 @@ func (l *Logger) Update(o Options) error {
 	// l.writer, which fans bytes to innerWriter (below) and, when set,
 	// lokiWriter (write_to) — so write_to receives logs regardless of
 	// destination.
-	if o.EffectiveDestination() == LogDestinationWindowsEventLog {
+	//
+	// Trade-off: a Log goroutine can load the old handler microseconds before
+	// Update swaps it in, so during a reload there is a brief window where a
+	// record may dispatch through the previous configuration — e.g. an event
+	// log → stderr reload could duplicate a record (old fanoutHandler still
+	// writes to event log while the new stderr path also writes), and an
+	// event log reload could send a record to a just-closed event log handle
+	// (which returns an error from el.Info but does not crash). Accepted
+	// because (1) config reloads are rare, (2) the worst case is a couple of
+	// duplicated or dropped records per reload, and (3) the alternative —
+	// holding bufferMut for the entire dispatch — would let a slow sink
+	// (e.g. a blocked Loki receiver) stall Update indefinitely, which is a
+	// worse failure mode.
+	if o.Destination == LogDestinationWindowsEventLog {
 		el, err := l.eventLogOpener("Alloy")
 		if err != nil {
 			return fmt.Errorf("failed to open Windows Event Log: %w", err)
 		}
-		l.windowsEventLogHandler = newWindowsEventLogHandler(el, l.level, replace)
-		if l.windowsEventLogHandler == nil {
+		l.windowsEventLogHandler, err = newWindowsEventLogHandler(el, l.level, replace)
+		if err != nil {
 			return fmt.Errorf("failed to create Windows Event Log handler: %w", err)
 		}
 		// Suppress innerWriter so the bytes handler only feeds write_to; the

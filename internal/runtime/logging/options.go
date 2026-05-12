@@ -12,25 +12,11 @@ import (
 
 // Options is a set of options used to construct and configure a Logger.
 type Options struct {
-	Level       Level           `alloy:"level,attr,optional"`
-	Format      Format          `alloy:"format,attr,optional"`
-	Destination *LogDestination `alloy:"destination,attr,optional"`
+	Level       Level          `alloy:"level,attr,optional"`
+	Format      Format         `alloy:"format,attr,optional"`
+	Destination LogDestination `alloy:"destination,attr,optional"`
 
 	WriteTo []loki.LogsReceiver `alloy:"write_to,attr,optional"`
-}
-
-// EffectiveDestination returns the log destination to use. When Destination is
-// nil (not explicitly set by the user), it returns LogDestinationWindowsEventLog
-// if the process is running as a Windows service, and LogDestinationStderr
-// otherwise.
-func (o *Options) EffectiveDestination() LogDestination {
-	if o.Destination != nil {
-		return *o.Destination
-	}
-	if isWindowsService() {
-		return LogDestinationWindowsEventLog
-	}
-	return LogDestinationStderr
 }
 
 // LogDestination is where to send the primary log output.
@@ -42,20 +28,11 @@ const (
 	LogDestinationWindowsEventLog LogDestination = "windows_event_log"
 )
 
-var _ syntax.Defaulter = (*LogDestination)(nil)
 var _ encoding.TextUnmarshaler = (*LogDestination)(nil)
-
-// SetToDefault implements syntax.Defaulter.
-func (d *LogDestination) SetToDefault() {
-	*d = LogDestinationStderr
-}
 
 // UnmarshalText implements encoding.TextUnmarshaler.
 func (d *LogDestination) UnmarshalText(text []byte) error {
 	switch LogDestination(text) {
-	case "":
-		*d = LogDestinationStderr
-		return nil
 	case LogDestinationStderr, LogDestinationWindowsEventLog:
 		*d = LogDestination(text)
 		return nil
@@ -64,20 +41,29 @@ func (d *LogDestination) UnmarshalText(text []byte) error {
 	}
 }
 
+// defaultDestination returns the platform-appropriate default log destination.
+func defaultDestination() LogDestination {
+	if isWindowsService() {
+		return LogDestinationWindowsEventLog
+	}
+	return LogDestinationStderr
+}
+
 // DefaultOptions holds defaults for creating a Logger.
 var DefaultOptions = Options{
-	Level:  LevelDefault,
-	Format: FormatDefault,
-	// Destination is nil: EffectiveDestination() resolves the correct default
-	// at runtime (windows_event_log when running as a Windows service, stderr
-	// otherwise).
+	Level:       LevelDefault,
+	Format:      FormatDefault,
+	Destination: defaultDestination(),
 }
 
 var _ syntax.Defaulter = (*Options)(nil)
 
-// SetToDefault implements syntax.Defaulter.
+// SetToDefault implements syntax.Defaulter. Destination is re-evaluated so
+// tests that stub isWindowsService after package init still observe the
+// expected default.
 func (o *Options) SetToDefault() {
 	*o = DefaultOptions
+	o.Destination = defaultDestination()
 }
 
 // Level represents how verbose logging should be.

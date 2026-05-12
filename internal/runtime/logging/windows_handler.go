@@ -2,9 +2,9 @@ package logging
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
-	"sync"
 
 	"github.com/grafana/alloy/internal/runtime/logging/eventlog"
 )
@@ -16,22 +16,20 @@ type windowsEventLogHandler struct {
 	attrs    []slog.Attr
 	groups   []string
 	replacer func(groups []string, a slog.Attr) slog.Attr
-
-	mu sync.Mutex
 }
 
 var _ slog.Handler = (*windowsEventLogHandler)(nil)
 
 // newWindowsEventLogHandler creates a new Windows Event Log handler using the given EventLog.
-func newWindowsEventLogHandler(el eventlog.EventLog, level slog.Leveler, replacer func(groups []string, a slog.Attr) slog.Attr) *windowsEventLogHandler {
+func newWindowsEventLogHandler(el eventlog.EventLog, level slog.Leveler, replacer func(groups []string, a slog.Attr) slog.Attr) (*windowsEventLogHandler, error) {
 	if el == nil {
-		return nil
+		return nil, errors.New("event log is nil")
 	}
 	return &windowsEventLogHandler{
 		el:       el,
 		level:    level,
 		replacer: replacer,
-	}
+	}, nil
 }
 
 // Enabled reports whether the handler handles records at the given level.
@@ -44,9 +42,6 @@ func (h *windowsEventLogHandler) Handle(ctx context.Context, r slog.Record) erro
 	if !h.Enabled(ctx, r.Level) {
 		return nil
 	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	// Build the log message
 	var buf strings.Builder

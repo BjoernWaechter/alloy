@@ -17,7 +17,10 @@ import (
 //     It does not walk up the process tree but it's the "official" way to check.
 //  2. hasServiceAncestor: walks the full ancestor chain looking for services.exe,
 //     covering cases where a launcher sits between the SCM and this process.
-func isWindowsService() bool {
+//
+// Stored as a var so tests can stub it; reassigning is the only supported way
+// to control its return value in tests.
+var isWindowsService = func() bool {
 	if ok, err := svc.IsWindowsService(); err == nil && ok {
 		return true
 	}
