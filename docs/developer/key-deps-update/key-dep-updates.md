@@ -88,6 +88,124 @@ To determine if a fork is still needed, use these commands in sequence:
 6. Search recent commits in paths the fork modified: `gh api 'repos/<upstream-org>/<repo-name>/commits?path=<relevant-path>&sha=main' --jq '.[0:15] | .[] | "\(.sha[0:7])  \(.commit.author.date)  \(.commit.message|split("\n")[0])"'`
 7. Search PRs with keywords from fork purpose: `gh pr list -R <upstream-org>/<repo-name> -S "<keywords>" --state merged -L 10`
 
+## Cross-cutting guidance
+
+These topics apply across multiple steps below. Read them before starting an
+update — they explain the shape of the work, not the literal sequence.
+
+### Compatibility cliffs
+
+Real-world dep-update work surfaces upstream API breaks that recur from one
+upgrade to the next (or that have non-obvious migrations). The
+[`cliffs.md`](./cliffs.md) ledger captures these by version transition and
+symbol. When you hit a compile error after bumping a key dep, search
+`cliffs.md` by the failing symbol or struct field before going on a deeper
+investigation — it may already document the migration. When you discover a new
+break, add an entry before merging.
+
+### Multi-module gotchas
+
+Alloy is a multi-module repo. At minimum:
+
+- `go.mod` (root)
+- `collector/go.mod`
+- `extension/alloyengine/go.mod`
+
+Each module resolves dependencies independently via Go's minimum-version
+selection. Bumping a transitive in one module **does not** propagate to the
+others. If you `go get foo/bar@vX.Y.Z` in the root, the collector module may
+still pin an older version of `foo/bar` through its own require graph.
+
+Practical rules:
+
+- For libraries the build resolves from multiple modules (pyroscope/api, OTel
+  contrib packages, etc.), run `go get` in each module that resolves them.
+- `make generate-module-dependencies` and `make generate-otel-collector-distro`
+  reconcile what they can from `dependency-replacements.yaml`, but they do not
+  remove the per-module need — they regenerate the generated bits, not the
+  user-managed `require` blocks.
+- After any non-trivial bump, run both Make targets and inspect the resulting
+  diff across **all** `go.mod` files, not just root.
+
+### Snapshot-pin pattern
+
+When upstream has not shipped a release that meets your constraints (e.g. the
+matching otel-contrib release calls a Prometheus API that only exists on
+`main`), pin to a `main`-branch commit via a `replace` directive in
+`dependency-replacements.yaml`.
+
+Choosing the commit:
+
+- Pick the latest `main` commit that satisfies all your constraints — has the
+  API you need, and still has the fields that downstream forks reference.
+- The pseudo-version semver-orders relative to the closest reachable ancestor
+  tag. For your pinned commit to win MVS over a released tag that other modules
+  pull in, the commit must be **after** that tag on `main`. If the released
+  tag is not an ancestor of your commit, MVS may pick the released tag
+  instead.
+- Pseudo-version format: `vX.Y.Z-0.YYYYMMDDHHMMSS-<sha12>`. Easiest way to
+  generate one correctly is to add a temporary `replace ... => ... <sha>` to
+  `go.mod` and run `go mod tidy` — Go rewrites the SHA into the canonical
+  pseudo-version.
+
+Every snapshot pin should carry a comment in `dependency-replacements.yaml`
+explaining (a) which API or fix the pin captures and (b) the GA version that
+will let us drop the pin.
+
+### Rebase cadence
+
+Long-lived dep-update branches accumulate conflicts proportional to
+commits-behind-main. **Rebase weekly during active work.** Going more than ~100
+commits without a rebase tends to surface several additional in-Alloy
+migrations beyond the original scope, because `main` keeps adding new code
+that calls old prom/otel APIs. Catching those incrementally is cheap; catching
+them all at once after a long divergence is not.
+
+### Test files often have separate migrations
+
+When upstream changes a struct shape, source code and test code both need
+updating — but the failure modes are different.
+
+In particular: Go field promotion works for **accessing** embedded fields
+(`cfg.EnableHTTP2`) but **not** in struct literal initialisation. So a struct
+hierarchy reshuffle where reads keep compiling can still break every test that
+constructs a literal of that struct. Audit `_test.go` files for the same
+upstream patterns, not just non-test sources. The `prometheus-operator
+HTTPConfig` cliff in [`cliffs.md`](./cliffs.md) is a worked example.
+
+### Tool directives
+
+Alloy uses Go 1.24+ `tool` directives in `go.mod` (e.g.
+`tool github.com/99designs/gqlgen`). These can be silently dropped during
+rebases that touch `go.mod` heavily — `go mod tidy` will not put them back.
+After a major rebase, verify the `tool` block survived. If a tool is missing,
+restore it with `go get -tool github.com/...`. The `generate-graphql` Make
+target depends on this.
+
+### Verifying before claiming done
+
+Mandatory checklist for any "done" claim on a key-dep update. Run all of these
+and fix any failures before reporting completion:
+
+1. `make generate-module-dependencies` — runs clean, no diff against the
+   committed state.
+2. `make generate-otel-collector-distro` — runs clean, no diff.
+3. `make generate-graphql` — runs clean (only required if you touched GraphQL
+   sources, but cheap to run as a smoke check).
+4. `go build ./...` from the repo root — no errors. The Windows-only
+   `alloy-service` main is the one acceptable exception on non-Windows hosts.
+5. `(cd collector && go build ./...)` — no errors.
+6. `make lint` — 0 issues.
+7. Run tests for every directly touched package, not just the package you
+   "expect" to be affected. A struct rename can ripple through tests in
+   unrelated-looking dirs.
+
+Use the Go toolchain the repo declares (currently Go 1.26.2; check `go.mod`
+for the authoritative `toolchain` directive). The directive should auto-fetch
+the right toolchain, but a stale `GOTOOLCHAIN=local` or an older local Go can
+silently produce different `go mod tidy` results than CI — verify your
+toolchain matches before debugging mysterious diffs.
+
 ## Key Dependency Relationships
 
 Here is a summary of the relationships between the key dependencies of Alloy.
