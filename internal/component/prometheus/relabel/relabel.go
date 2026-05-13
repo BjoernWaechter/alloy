@@ -268,8 +268,11 @@ func (c *Component) relabel(val float64, lbls labels.Labels) labels.Labels {
 		// Relabel against a copy of the labels to prevent modifying the original
 		// slice.
 		lb := labels.NewBuilder(lbls)
-		keep = relabel.ProcessBuilder(lb, c.mrc...)
-		relabelled = lb.Labels()
+		if keep = relabel.ProcessBuilder(lb, c.mrc...); keep {
+			relabelled = lb.Labels()
+		} else {
+			relabelled = labels.EmptyLabels()
+		}
 		c.cacheMisses.Inc()
 		c.addToCache(lbls, relabelled, keep)
 	}
