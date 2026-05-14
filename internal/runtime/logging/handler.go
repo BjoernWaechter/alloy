@@ -52,6 +52,14 @@ func (h *bytesHandler) Enabled(ctx context.Context, l slog.Level) bool {
 }
 
 func (h *bytesHandler) Handle(ctx context.Context, r slog.Record) error {
+	// Skip formatting entirely when the writer has no active sink — i.e.,
+	// destination=windows_event_log with no write_to and no temporary
+	// writer attached. The slog text/JSON handler would otherwise allocate
+	// a buffer, run ReplaceAttr on every attribute, and hand the formatted
+	// bytes to io.Discard.
+	if sa, ok := h.w.(interface{ HasSink() bool }); ok && !sa.HasSink() {
+		return nil
+	}
 	return h.buildHandler().Handle(ctx, r)
 }
 

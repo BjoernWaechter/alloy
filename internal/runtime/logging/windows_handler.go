@@ -2,16 +2,34 @@ package logging
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/grafana/alloy/internal/runtime/logging/eventlog"
 )
 
-// windowsEventLogHandler is a slog.Handler that writes logs to the Windows Event Log.
+// eventLogState is shared by a windowsEventLogHandler and every handler
+// derived from it via WithAttrs/WithGroup. It holds the underlying event
+// log handle and synchronizes its lifecycle.
+//
+// mu is acquired for read by Handle/Enabled and for write by SetEventLog
+// and Close. Because Close takes the write lock, it waits for any in-flight
+// Handle calls to finish — so we can safely close the OS handle without
+// the risk of another goroutine calling Info/Warning/Error on a just-closed
+// handle.
+type eventLogState struct {
+	mu sync.RWMutex
+	el eventlog.EventLog // nil when not open
+}
+
+// windowsEventLogHandler is a slog.Handler that writes logs to the Windows
+// Event Log. All per-instance state (attrs, groups, replacer, level) is
+// immutable after construction; WithAttrs/WithGroup return new handlers that
+// share the same *eventLogState, so a Close on any derived handler observes
+// every in-flight Handle.
 type windowsEventLogHandler struct {
-	el       eventlog.EventLog
+	state    *eventLogState
 	level    slog.Leveler
 	attrs    []slog.Attr
 	groups   []string
@@ -20,57 +38,70 @@ type windowsEventLogHandler struct {
 
 var _ slog.Handler = (*windowsEventLogHandler)(nil)
 
-// newWindowsEventLogHandler creates a new Windows Event Log handler using the given EventLog.
-func newWindowsEventLogHandler(el eventlog.EventLog, level slog.Leveler, replacer func(groups []string, a slog.Attr) slog.Attr) (*windowsEventLogHandler, error) {
-	if el == nil {
-		return nil, errors.New("event log is nil")
-	}
+// newWindowsEventLogHandler creates a handler with no underlying event log
+// installed. Call SetEventLog to open dispatching; Close to release it.
+func newWindowsEventLogHandler(level slog.Leveler, replacer func(groups []string, a slog.Attr) slog.Attr) *windowsEventLogHandler {
 	return &windowsEventLogHandler{
-		el:       el,
+		state:    &eventLogState{},
 		level:    level,
 		replacer: replacer,
-	}, nil
+	}
 }
 
-// Enabled reports whether the handler handles records at the given level.
-func (h *windowsEventLogHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return level >= h.level.Level()
+// SetEventLog installs the underlying Windows Event Log handle. Safe to
+// call concurrently with Handle/Enabled on any handler sharing the same
+// state.
+func (h *windowsEventLogHandler) SetEventLog(el eventlog.EventLog) {
+	h.state.mu.Lock()
+	defer h.state.mu.Unlock()
+	h.state.el = el
 }
 
-// Handle handles the Record.
-func (h *windowsEventLogHandler) Handle(ctx context.Context, r slog.Record) error {
-	if !h.Enabled(ctx, r.Level) {
+// IsOpen reports whether an event log handle is currently installed.
+func (h *windowsEventLogHandler) IsOpen() bool {
+	h.state.mu.RLock()
+	defer h.state.mu.RUnlock()
+	return h.state.el != nil
+}
+
+// Enabled reports whether the handler dispatches records at the given level.
+// Returns false when the handle has been closed.
+func (h *windowsEventLogHandler) Enabled(_ context.Context, level slog.Level) bool {
+	h.state.mu.RLock()
+	defer h.state.mu.RUnlock()
+	return h.state.el != nil && level >= h.level.Level()
+}
+
+// Handle dispatches the record to the Windows Event Log. Holds the state
+// RLock for the entire call, so a concurrent Close blocks until this call
+// returns — no risk of calling Info/Warning/Error on a closed handle.
+func (h *windowsEventLogHandler) Handle(_ context.Context, r slog.Record) error {
+	h.state.mu.RLock()
+	defer h.state.mu.RUnlock()
+	if h.state.el == nil {
 		return nil
 	}
+	el := h.state.el
 
-	// Build the log message
 	var buf strings.Builder
-
-	// Add the message first
 	if r.Message != "" {
 		buf.WriteString(r.Message)
 	}
 
-	// Add attributes
 	attrs := make([]slog.Attr, 0, len(h.attrs)+r.NumAttrs())
 	attrs = append(attrs, h.attrs...)
-
 	r.Attrs(func(a slog.Attr) bool {
 		attrs = append(attrs, a)
 		return true
 	})
 
-	// Apply the replacer function to each attribute
 	for _, attr := range attrs {
 		if h.replacer != nil {
 			attr = h.replacer(h.groups, attr)
 		}
-
-		// Skip empty attributes
 		if attr.Key == "" {
 			continue
 		}
-
 		if buf.Len() > 0 {
 			buf.WriteString(" ")
 		}
@@ -81,25 +112,23 @@ func (h *windowsEventLogHandler) Handle(ctx context.Context, r slog.Record) erro
 
 	message := buf.String()
 	if message == "" {
-		return nil // Don't log empty messages
+		return nil
 	}
 
-	// Determine the event log level and write to Windows Event Log
 	switch r.Level {
 	case slog.LevelDebug, slog.LevelInfo:
-		return h.el.Info(1, message)
+		return el.Info(1, message)
 	case slog.LevelWarn:
-		return h.el.Warning(1, message)
+		return el.Warning(1, message)
 	case slog.LevelError:
-		return h.el.Error(1, message)
+		return el.Error(1, message)
 	default:
-		// For unknown levels, default to Info
-		return h.el.Info(1, message)
+		return el.Info(1, message)
 	}
 }
 
-// WithAttrs returns a new Handler whose attributes consist of
-// both the receiver's attributes and the arguments.
+// WithAttrs returns a new handler with additional attributes, sharing the
+// same eventLogState so it honors lifecycle changes.
 func (h *windowsEventLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	newAttrs := make([]slog.Attr, 0, len(h.attrs)+len(attrs))
 	newAttrs = append(newAttrs, h.attrs...)
@@ -109,7 +138,7 @@ func (h *windowsEventLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	copy(newGroups, h.groups)
 
 	return &windowsEventLogHandler{
-		el:       h.el,
+		state:    h.state,
 		level:    h.level,
 		attrs:    newAttrs,
 		groups:   newGroups,
@@ -117,8 +146,8 @@ func (h *windowsEventLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
-// WithGroup returns a new Handler with the given group appended to
-// the receiver's existing groups.
+// WithGroup returns a new handler with the additional group, sharing the
+// same eventLogState.
 func (h *windowsEventLogHandler) WithGroup(name string) slog.Handler {
 	newAttrs := make([]slog.Attr, len(h.attrs))
 	copy(newAttrs, h.attrs)
@@ -128,7 +157,7 @@ func (h *windowsEventLogHandler) WithGroup(name string) slog.Handler {
 	newGroups = append(newGroups, name)
 
 	return &windowsEventLogHandler{
-		el:       h.el,
+		state:    h.state,
 		level:    h.level,
 		attrs:    newAttrs,
 		groups:   newGroups,
@@ -136,10 +165,17 @@ func (h *windowsEventLogHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// Close closes the Windows Event Log.
+// Close closes the underlying event log handle and disables dispatching.
+// Takes the write lock, which waits for any in-flight Handle calls to
+// finish — so the handle is never closed while another goroutine is using
+// it. Idempotent.
 func (h *windowsEventLogHandler) Close() error {
-	if h.el != nil {
-		return h.el.Close()
+	h.state.mu.Lock()
+	defer h.state.mu.Unlock()
+	if h.state.el == nil {
+		return nil
 	}
-	return nil
+	err := h.state.el.Close()
+	h.state.el = nil
+	return err
 }

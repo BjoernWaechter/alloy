@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
-	"go.uber.org/atomic"
 
 	"github.com/grafana/alloy/internal/component/common/loki"
 	"github.com/grafana/alloy/internal/runtime/logging/eventlog"
@@ -40,22 +39,18 @@ type Logger struct {
 	eventLogOpener         eventlog.EventLogOpener // Opens the Windows event log; set in NewDeferred, overridable via SetEventLogOpener for tests.
 
 	// handler is the slog.Handler dispatched to by both the gokit and slog
-	// paths. It is l.bytesHandler by default and a
-	// fanoutHandler{windowsEventLogHandler, bytesHandler} when the Windows
-	// Event Log destination is active. Stored atomically so Log/Enabled can
-	// read it without a lock while Update reassigns it.
-	handler atomic.Pointer[handlerHolder]
+	// paths. It is a stable fanoutHandler{windowsEventLogHandler, bytesHandler}
+	// set once in NewDeferred and never reassigned. The two children carry
+	// their own enable/disable state with drain-on-disable semantics so
+	// Update can flip destinations without losing any in-flight record.
+	handler slog.Handler
 }
-
-// handlerHolder wraps a slog.Handler so it can be stored in an
-// atomic.Pointer (which requires a concrete pointer type).
-type handlerHolder struct{ h slog.Handler }
 
 var _ EnabledAware = (*Logger)(nil)
 
 // Enabled implements EnabledAware interface.
 func (l *Logger) Enabled(ctx context.Context, level slog.Level) bool {
-	return l.handler.Load().h.Enabled(ctx, level)
+	return l.handler.Enabled(ctx, level)
 }
 
 // New creates a New logger with the default log level and format.
@@ -88,8 +83,12 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 	var (
 		leveler slog.LevelVar
 		format  formatVar
-		writer  writerVar
 	)
+	// innerWriter is stable for the life of the Logger; destinations that
+	// want to suppress it (windows_event_log) flip writerVar.suppressInner
+	// instead of swapping the writer.
+	writer := &writerVar{innerWriter: w}
+
 	l := &Logger{
 		inner: w,
 
@@ -98,16 +97,19 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 
 		level:  &leveler,
 		format: &format,
-		writer: &writer,
+		writer: writer,
 		bytesHandler: &bytesHandler{
-			w:         &writer,
+			w:         writer,
 			leveler:   &leveler,
 			formatter: &format,
 			replacer:  replace,
 		},
 		eventLogOpener: eventlog.GetEventLogOpener(),
 	}
-	l.handler.Store(&handlerHolder{h: l.bytesHandler})
+	// The handler structure is stable for the life of the Logger; Update
+	// flips state on the children rather than reassigning l.handler.
+	l.windowsEventLogHandler = newWindowsEventLogHandler(l.level, replace)
+	l.handler = fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}
 	l.deferredSlog = newDeferredHandler(l)
 
 	return l, nil
@@ -142,82 +144,93 @@ func (l *Logger) Update(o Options) error {
 	l.bufferMut.Lock()
 	l.level.Set(slogLevel(o.Level).Level())
 	l.format.Set(o.Format)
-
-	// Close any existing Windows Event Log handler; we'll open a fresh one
-	// below if the destination still calls for it.
-	if l.windowsEventLogHandler != nil {
-		_ = l.windowsEventLogHandler.Close()
-		l.windowsEventLogHandler = nil
-	}
-	// Configure the destination. The bytes handler always writes through
-	// l.writer, which fans bytes to innerWriter (below) and, when set,
-	// lokiWriter (write_to) — so write_to receives logs regardless of
-	// destination.
-	//
-	// Trade-off: a Log goroutine can load the old handler microseconds before
-	// Update swaps it in, so during a reload there is a brief window where a
-	// record may dispatch through the previous configuration — e.g. an event
-	// log → stderr reload could duplicate a record (old fanoutHandler still
-	// writes to event log while the new stderr path also writes), and an
-	// event log reload could send a record to a just-closed event log handle
-	// (which returns an error from el.Info but does not crash). Accepted
-	// because (1) config reloads are rare, (2) the worst case is a couple of
-	// duplicated or dropped records per reload, and (3) the alternative —
-	// holding bufferMut for the entire dispatch — would let a slow sink
-	// (e.g. a blocked Loki receiver) stall Update indefinitely, which is a
-	// worse failure mode.
-	if o.Destination == LogDestinationWindowsEventLog {
-		el, err := l.eventLogOpener("Alloy")
-		if err != nil {
-			return fmt.Errorf("failed to open Windows Event Log: %w", err)
-		}
-		l.windowsEventLogHandler, err = newWindowsEventLogHandler(el, l.level, replace)
-		if err != nil {
-			return fmt.Errorf("failed to create Windows Event Log handler: %w", err)
-		}
-		// Suppress innerWriter so the bytes handler only feeds write_to; the
-		// event log itself is delivered via windowsEventLogHandler.
-		l.writer.SetInnerWriter(io.Discard)
-		l.handler.Store(&handlerHolder{h: fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}})
-	} else {
-		l.writer.SetInnerWriter(l.inner)
-		l.handler.Store(&handlerHolder{h: l.bytesHandler})
+	if err := l.applyDestination(o.Destination); err != nil {
+		l.bufferMut.Unlock()
+		return err
 	}
 	if len(o.WriteTo) > 0 {
 		l.writer.SetLokiWriter(&lokiWriter{o.WriteTo})
 	}
 	l.bufferMut.Unlock()
 
-	// Build deferred handlers outside bufferMut to avoid a deadlock: concurrent
-	// Handle() calls hold a child handler's RLock while waiting for bufferMut
-	// (via addRecord), while Update holding bufferMut and waiting for the child's
-	// write lock in buildHandlers creates a cycle.
+	// Rebuild deferred slog handlers outside bufferMut to avoid a deadlock
+	// with concurrent Handle() calls (they hold a child handler's RLock
+	// while waiting for bufferMut via addRecord).
 	if l.deferredSlog != nil {
 		l.deferredSlog.buildHandlers(nil)
 	}
+	l.flushBuffer()
+	return nil
+}
 
-	// Flip hasLogFormat and drain/replay while holding bufferMut so new Log()
-	// calls block on RLock until replay finishes — preserving the original
-	// guarantee that buffered logs are emitted before newly-arriving ones.
+// applyDestination toggles state on the (stable) child handlers to match
+// the new destination. Must be called with l.bufferMut held by the caller.
+//
+// The architecture is loss-free by construction:
+//   - l.handler is a stable fanout over windowsEventLogHandler and
+//     bytesHandler — Update never reassigns it.
+//   - Each child carries its own state behind a sync.RWMutex with
+//     drain-on-disable semantics. Handle/Write take RLock; the mutators
+//     (Close, SetSuppressInner) take Lock so they wait for in-flight calls
+//     to finish before flipping state.
+//
+// Every in-flight Log dispatch therefore completes against the
+// configuration that was active when it started, and never observes a
+// closed handle or a half-changed writer.
+//
+// Adding a future "none" destination: extend the suppress condition to
+// cover it — one line.
+func (l *Logger) applyDestination(d LogDestination) error {
+	willHaveEventLog := d == LogDestinationWindowsEventLog
+
+	if willHaveEventLog && !l.windowsEventLogHandler.IsOpen() {
+		el, err := l.eventLogOpener("Alloy")
+		if err != nil {
+			return fmt.Errorf("failed to open Windows Event Log: %w", err)
+		}
+		l.windowsEventLogHandler.SetEventLog(el)
+	}
+
+	if willHaveEventLog {
+		// Order: open event log first (above) so by the time we suppress
+		// inner, the event log path is already accepting records.
+		l.writer.SetSuppressInner(true)
+	} else {
+		// Order: unsuppress first so in-flight Logs that were in event_log
+		// mode and now race past SetSuppressInner deliver to stderr; then
+		// close the event log (which drains any in-flight event-log
+		// dispatches before releasing the OS handle).
+		l.writer.SetSuppressInner(false)
+		if l.windowsEventLogHandler.IsOpen() {
+			_ = l.windowsEventLogHandler.Close()
+		}
+	}
+	return nil
+}
+
+// flushBuffer drains and replays any logs that were buffered before
+// Update finished resolving the log format. It must be called AFTER the
+// new destination has been applied (so replayed records go through the
+// right handler) and AFTER l.deferredSlog.buildHandlers has run (so
+// child handlers point at the new l.handler).
+//
+// Holds bufferMut for the entire replay so concurrent Log() calls block
+// until the buffer is drained, preserving the order guarantee that
+// buffered logs appear before newly-arriving ones.
+func (l *Logger) flushBuffer() {
 	l.bufferMut.Lock()
 	defer l.bufferMut.Unlock()
 	l.hasLogFormat = true
 	buffer := l.buffer
 	l.buffer = nil
 
-	// Replay buffered logs. The bufferedItem's handler (for slog records) was
-	// rebuilt above via deferredSlog.buildHandlers and now points at l.handler,
-	// which fans out to the event log + bytes handler when both are needed.
-	h := l.handler.Load().h
-	for _, bufferedLogChunk := range buffer {
-		if len(bufferedLogChunk.kvps) > 0 {
-			slogadapter.GoKit(h).Log(bufferedLogChunk.kvps...)
-		} else if bufferedLogChunk.handler.Enabled(context.Background(), bufferedLogChunk.record.Level) {
-			_ = bufferedLogChunk.handler.Handle(context.Background(), bufferedLogChunk.record)
+	for _, item := range buffer {
+		if len(item.kvps) > 0 {
+			slogadapter.GoKit(l.handler).Log(item.kvps...)
+		} else if item.handler.Enabled(context.Background(), item.record.Level) {
+			_ = item.handler.Handle(context.Background(), item.record)
 		}
 	}
-
-	return nil
 }
 
 func (l *Logger) SetTemporaryWriter(w io.Writer) {
@@ -248,7 +261,7 @@ func (l *Logger) Log(kvps ...any) error {
 
 	// NOTE(rfratto): slogadapter is a temporary shim while log/slog is still
 	// being adopted throughout the codebase.
-	return slogadapter.GoKit(l.handler.Load().h).Log(kvps...)
+	return slogadapter.GoKit(l.handler).Log(kvps...)
 }
 
 func (l *Logger) addRecord(r slog.Record, df *deferredSlogHandler) {
@@ -311,9 +324,10 @@ func (f *formatVar) Set(format Format) {
 type writerVar struct {
 	mut sync.RWMutex
 
-	lokiWriter  *lokiWriter
-	innerWriter io.Writer
-	tmpWriter   io.Writer
+	lokiWriter    *lokiWriter
+	innerWriter   io.Writer
+	tmpWriter     io.Writer
+	suppressInner bool // when true, Write skips innerWriter
 }
 
 func (w *writerVar) SetTemporaryWriter(writer io.Writer) {
@@ -328,16 +342,32 @@ func (w *writerVar) RemoveTemporaryWriter() {
 	w.tmpWriter = nil
 }
 
-func (w *writerVar) SetInnerWriter(writer io.Writer) {
-	w.mut.Lock()
-	defer w.mut.Unlock()
-	w.innerWriter = writer
-}
-
 func (w *writerVar) SetLokiWriter(writer *lokiWriter) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	w.lokiWriter = writer
+}
+
+// SetSuppressInner toggles whether Write delivers bytes to innerWriter.
+// Acquires the write lock, so it waits for any in-flight Write calls to
+// finish before flipping — guaranteeing in-flight Logs complete against
+// the previous state.
+func (w *writerVar) SetSuppressInner(b bool) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	w.suppressInner = b
+}
+
+// HasSink reports whether any active sink will actually consume bytes
+// written to this writerVar. Used by bytesHandler.Handle to skip formatting
+// entirely when every sink would silently drop the result (event_log
+// destination with no write_to and no temporary writer attached).
+func (w *writerVar) HasSink() bool {
+	w.mut.RLock()
+	defer w.mut.RUnlock()
+	return (w.innerWriter != nil && !w.suppressInner) ||
+		w.lokiWriter != nil ||
+		w.tmpWriter != nil
 }
 
 func (w *writerVar) Write(p []byte) (int, error) {
@@ -350,8 +380,10 @@ func (w *writerVar) Write(p []byte) (int, error) {
 
 	// The following is effectively an io.Multiwriter, but without updating
 	// the Multiwriter each time tmpWriter is added or removed.
-	if _, err := w.innerWriter.Write(p); err != nil {
-		return 0, err
+	if !w.suppressInner {
+		if _, err := w.innerWriter.Write(p); err != nil {
+			return 0, err
+		}
 	}
 
 	if w.lokiWriter != nil {
