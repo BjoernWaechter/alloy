@@ -205,53 +205,122 @@ func Test_lokiWriter_nil(t *testing.T) {
 	})
 }
 
-// TestWriteToDisabledViaUpdate verifies that logs go to both stderr and the
-// configured write_to receiver while write_to is set, and that calling Update
-// with an empty WriteTo stops sending logs to the receiver while still emitting
-// to stderr.
-func TestWriteToDisabledViaUpdate(t *testing.T) {
+// TestUpdateRoutesLogs walks the logger through every combination of
+// destination (stderr/none) and write_to (zero/one/many receivers), and for
+// each step verifies that exactly the expected sinks observe the log.
+func TestUpdateRoutesLogs(t *testing.T) {
+	const (
+		// arrivalTimeout bounds how long we wait for a sink we *expect* to
+		// receive a log.
+		arrivalTimeout = time.Second
+		// arrivalPollInterval is how often we re-check the expected sink
+		// while waiting.
+		arrivalPollInterval = 10 * time.Millisecond
+		// absenceWait is how long we let any (incorrect) write land before
+		// asserting that a sink we do *not* expect remained empty.
+		absenceWait = 100 * time.Millisecond
+	)
+
 	var buf safeBuffer
-	receiver := loki.NewLogsReceiver(loki.WithChannel(make(chan loki.Entry, 16)))
-
-	logger, err := logging.New(&buf, debugLevel())
-	require.NoError(t, err)
-
-	require.NoError(t, logger.Update(logging.Options{
-		Level:   logging.LevelDebug,
-		Format:  logging.FormatLogfmt,
-		WriteTo: []loki.LogsReceiver{receiver},
-	}))
-
-	require.NoError(t, logger.Log("msg", "with-write-to"))
-
-	require.Eventually(t, func() bool {
-		return strings.Contains(buf.String(), "with-write-to")
-	}, time.Second, 10*time.Millisecond, "stderr did not receive log while write_to was enabled")
-
-	select {
-	case entry := <-receiver.Chan():
-		require.Contains(t, entry.Line, "with-write-to")
-	case <-time.After(time.Second):
-		t.Fatal("write_to receiver did not receive log while write_to was enabled")
+	receivers := []loki.LogsReceiver{
+		loki.NewLogsReceiver(loki.WithChannel(make(chan loki.Entry, 16))),
+		loki.NewLogsReceiver(loki.WithChannel(make(chan loki.Entry, 16))),
 	}
 
-	require.NoError(t, logger.Update(logging.Options{
-		Level:  logging.LevelDebug,
-		Format: logging.FormatLogfmt,
-	}))
+	logger, err := logging.NewDeferred(&buf)
+	require.NoError(t, err)
 
-	beforeLen := buf.String()
-	require.NoError(t, logger.Log("msg", "without-write-to"))
+	steps := []struct {
+		name          string
+		destination   logging.LogDestination
+		writeTo       []int // indices into receivers
+		wantStderr    bool
+		wantReceivers []int // indices into receivers
+	}{
+		{
+			name:        "destination=none, no write_to: everything dropped",
+			destination: logging.LogDestinationNone,
+		},
+		{
+			name:          "destination=none with write_to: only receiver gets the log",
+			destination:   logging.LogDestinationNone,
+			writeTo:       []int{0},
+			wantReceivers: []int{0},
+		},
+		{
+			name:          "destination=stderr with write_to: stderr and receiver get the log",
+			destination:   logging.LogDestinationStderr,
+			writeTo:       []int{0},
+			wantStderr:    true,
+			wantReceivers: []int{0},
+		},
+		{
+			name:          "destination=stderr with multiple receivers: stderr and all receivers get the log",
+			destination:   logging.LogDestinationStderr,
+			writeTo:       []int{0, 1},
+			wantStderr:    true,
+			wantReceivers: []int{0, 1},
+		},
+		{
+			name:        "destination=stderr, write_to cleared: only stderr gets the log",
+			destination: logging.LogDestinationStderr,
+			wantStderr:  true,
+		},
+		{
+			name:        "destination=none, write_to cleared: everything dropped",
+			destination: logging.LogDestinationNone,
+		},
+	}
 
-	require.Eventually(t, func() bool {
-		return strings.Contains(buf.String(), "without-write-to")
-	}, time.Second, 10*time.Millisecond, "stderr did not receive log after write_to was disabled")
-	require.Greater(t, len(buf.String()), len(beforeLen))
+	for i, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			var writeTo []loki.LogsReceiver
+			for _, idx := range step.writeTo {
+				writeTo = append(writeTo, receivers[idx])
+			}
+			require.NoError(t, logger.Update(logging.Options{
+				Level:       logging.LevelDebug,
+				Format:      logging.FormatLogfmt,
+				Destination: step.destination,
+				WriteTo:     writeTo,
+			}))
 
-	select {
-	case entry := <-receiver.Chan():
-		t.Fatalf("write_to receiver got log %q after write_to was disabled", entry.Line)
-	case <-time.After(100 * time.Millisecond):
+			msg := fmt.Sprintf("step-%d", i)
+			beforeBuf := buf.String()
+			require.NoError(t, logger.Log("msg", msg))
+
+			if step.wantStderr {
+				require.Eventually(t, func() bool {
+					return strings.Contains(buf.String(), msg)
+				}, arrivalTimeout, arrivalPollInterval, "stderr did not receive %q", msg)
+			} else {
+				time.Sleep(absenceWait)
+				require.NotContains(t, strings.TrimPrefix(buf.String(), beforeBuf), msg,
+					"stderr unexpectedly received %q", msg)
+			}
+
+			wantSet := make(map[int]bool, len(step.wantReceivers))
+			for _, idx := range step.wantReceivers {
+				wantSet[idx] = true
+			}
+			for idx, r := range receivers {
+				if wantSet[idx] {
+					select {
+					case entry := <-r.Chan():
+						require.Contains(t, entry.Line, msg,
+							"receiver %d got wrong log", idx)
+					case <-time.After(arrivalTimeout):
+						t.Fatalf("receiver %d did not receive %q", idx, msg)
+					}
+				} else {
+					select {
+					case entry := <-r.Chan():
+						t.Fatalf("receiver %d unexpectedly got %q", idx, entry.Line)
+					case <-time.After(absenceWait):
+					}
+				}
+			}
+		})
 	}
 }
 
