@@ -4,6 +4,7 @@ package beyla
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -452,6 +453,11 @@ func (c *Component) Handler() http.Handler {
 
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, context.Canceled) {
+				// Client disconnected or Alloy is shutting down
+				level.Debug(c.opts.Logger).Log("msg", "proxy request cancelled", "err", err)
+				return
+			}
 			if ready {
 				level.Error(c.opts.Logger).Log("msg", "proxy error", "err", err)
 				http.Error(w, "subprocess unavailable", http.StatusBadGateway)
