@@ -22,8 +22,6 @@ type EnabledAware interface {
 // Logger is the logging subsystem of Alloy. It supports being dynamically
 // updated at runtime.
 type Logger struct {
-	inner io.Writer // Writer passed to New.
-
 	bufferMut    sync.RWMutex
 	buffer       []*bufferedItem // Store logs before correctly determine the log format
 	hasLogFormat bool            // Confirmation whether log format has been determined
@@ -31,15 +29,15 @@ type Logger struct {
 	level        *slog.LevelVar       // Current configured level.
 	format       *formatVar           // Current configured format.
 	writer       *writerVar           // Current configured multiwriter (inner + write_to).
-	handler      *handler             // Handler which handles logs.
-	deferredSlog *deferredSlogHandler // This handles deferred logging for slog.
+	bytesHandler *bytesHandler        // slog.Handler that formats records to bytes and writes through writer.
+	deferredSlog *deferredSlogHandler // Buffers slog output until config is loaded, then delegates to bytesHandler.
 }
 
 var _ EnabledAware = (*Logger)(nil)
 
 // Enabled implements EnabledAware interface.
 func (l *Logger) Enabled(ctx context.Context, level slog.Level) bool {
-	return l.handler.Enabled(ctx, level)
+	return l.bytesHandler.Enabled(ctx, level)
 }
 
 // New creates a New logger with the default log level and format.
@@ -72,19 +70,21 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 	var (
 		leveler slog.LevelVar
 		format  formatVar
-		writer  writerVar
 	)
-	l := &Logger{
-		inner: w,
+	// innerWriter is stable for the life of the Logger; destinations that
+	// want to suppress it (none) flip writerVar.suppressInner instead of
+	// swapping the writer.
+	writer := &writerVar{innerWriter: w}
 
+	l := &Logger{
 		buffer:       []*bufferedItem{},
 		hasLogFormat: false,
 
 		level:  &leveler,
 		format: &format,
-		writer: &writer,
-		handler: &handler{
-			w:         &writer,
+		writer: writer,
+		bytesHandler: &bytesHandler{
+			w:         writer,
 			leveler:   &leveler,
 			formatter: &format,
 			replacer:  replace,
@@ -125,42 +125,60 @@ func (l *Logger) Update(o Options) error {
 	l.level.Set(slogLevel(o.Level).Level())
 	l.format.Set(o.Format)
 
-	l.writer.SetInnerWriter(l.inner)
+	if err := l.applyDestination(o.Destination); err != nil {
+		l.bufferMut.Unlock()
+		return err
+	}
+
 	l.writer.SetLokiWriter(o.WriteTo)
 	l.bufferMut.Unlock()
 
-	// Build deferred handlers outside bufferMut to avoid a deadlock: concurrent
-	// Handle() calls hold a child handler's RLock while waiting for bufferMut
-	// (via addRecord), while Update holding bufferMut and waiting for the child's
-	// write lock in buildHandlers creates a cycle.
+	// Rebuild deferred slog handlers outside bufferMut to avoid a deadlock
+	// with concurrent Handle() calls (they hold a child handler's RLock
+	// while waiting for bufferMut via addRecord).
 	if l.deferredSlog != nil {
 		l.deferredSlog.buildHandlers(nil)
 	}
+	l.flushBuffer()
+	return nil
+}
 
-	// Flip hasLogFormat and drain/replay while holding bufferMut so new Log()
-	// calls block on RLock until replay finishes — preserving the original
-	// guarantee that buffered logs are emitted before newly-arriving ones.
+// applyDestination toggles state on the (stable) writerVar to match the
+// new destination. Must be called with l.bufferMut held by the caller.
+//
+// The architecture is loss-free by construction: writerVar.suppressInner
+// is guarded by a sync.RWMutex; Write takes RLock and SetSuppressInner
+// takes Lock, so flipping the flag waits for in-flight Writes to finish.
+// Every in-flight Log dispatch therefore completes against the
+// configuration that was active when it started.
+func (l *Logger) applyDestination(d LogDestination) error {
+	l.writer.SetSuppressInner(d == LogDestinationNone)
+	return nil
+}
+
+// flushBuffer drains and replays any logs that were buffered before
+// Update finished resolving the log format. It must be called AFTER the
+// new destination has been applied (so replayed records go through the
+// right handler) and AFTER l.deferredSlog.buildHandlers has run (so
+// child handlers point at the new bytesHandler).
+//
+// Holds bufferMut for the entire replay so concurrent Log() calls block
+// until the buffer is drained, preserving the order guarantee that
+// buffered logs appear before newly-arriving ones.
+func (l *Logger) flushBuffer() {
 	l.bufferMut.Lock()
 	defer l.bufferMut.Unlock()
 	l.hasLogFormat = true
 	buffer := l.buffer
 	l.buffer = nil
 
-	for _, bufferedLogChunk := range buffer {
-		if len(bufferedLogChunk.kvps) > 0 {
-			// the buffered logs are currently only sent to the standard output
-			// because the components with the receivers are not running yet
-			slogadapter.GoKit(l.handler).Log(bufferedLogChunk.kvps...)
-		} else {
-			// We can now check whether our buffered log is at the right level.
-			if bufferedLogChunk.handler.Enabled(context.Background(), bufferedLogChunk.record.Level) {
-				// These will always be valid due to the build handlers call above.
-				_ = bufferedLogChunk.handler.Handle(context.Background(), bufferedLogChunk.record)
-			}
+	for _, item := range buffer {
+		if len(item.kvps) > 0 {
+			slogadapter.GoKit(l.bytesHandler).Log(item.kvps...)
+		} else if item.handler.Enabled(context.Background(), item.record.Level) {
+			_ = item.handler.Handle(context.Background(), item.record)
 		}
 	}
-
-	return nil
 }
 
 func (l *Logger) SetTemporaryWriter(w io.Writer) {
@@ -173,7 +191,7 @@ func (l *Logger) RemoveTemporaryWriter() {
 
 // Log implements log.Logger.
 func (l *Logger) Log(kvps ...any) error {
-	// Buffer logs before confirming log format is configured in `logging` block
+	// Buffer logs before confirming log format is configured in `logging` block.
 	l.bufferMut.RLock()
 	if !l.hasLogFormat {
 		l.bufferMut.RUnlock()
@@ -189,9 +207,9 @@ func (l *Logger) Log(kvps ...any) error {
 		l.bufferMut.RUnlock()
 	}
 
-	// NOTE(rfratto): this method is a temporary shim while log/slog is still
+	// NOTE(rfratto): slogadapter is a temporary shim while log/slog is still
 	// being adopted throughout the codebase.
-	return slogadapter.GoKit(l.handler).Log(kvps...)
+	return slogadapter.GoKit(l.bytesHandler).Log(kvps...)
 }
 
 func (l *Logger) addRecord(r slog.Record, df *deferredSlogHandler) {
@@ -254,9 +272,10 @@ func (f *formatVar) Set(format Format) {
 type writerVar struct {
 	mut sync.RWMutex
 
-	lokiWriter  *lokiWriter
-	innerWriter io.Writer
-	tmpWriter   io.Writer
+	lokiWriter    *lokiWriter
+	innerWriter   io.Writer
+	tmpWriter     io.Writer
+	suppressInner bool // when true, Write skips innerWriter
 }
 
 func (w *writerVar) SetTemporaryWriter(writer io.Writer) {
@@ -271,12 +290,6 @@ func (w *writerVar) RemoveTemporaryWriter() {
 	w.tmpWriter = nil
 }
 
-func (w *writerVar) SetInnerWriter(writer io.Writer) {
-	w.mut.Lock()
-	defer w.mut.Unlock()
-	w.innerWriter = writer
-}
-
 func (w *writerVar) SetLokiWriter(receivers []loki.LogsReceiver) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
@@ -285,6 +298,16 @@ func (w *writerVar) SetLokiWriter(receivers []loki.LogsReceiver) {
 	} else {
 		w.lokiWriter = nil
 	}
+}
+
+// SetSuppressInner toggles whether Write delivers bytes to innerWriter.
+// Acquires the write lock, so it waits for any in-flight Write calls to
+// finish before flipping — guaranteeing in-flight Logs complete against
+// the previous state.
+func (w *writerVar) SetSuppressInner(b bool) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	w.suppressInner = b
 }
 
 func (w *writerVar) Write(p []byte) (int, error) {
@@ -297,8 +320,10 @@ func (w *writerVar) Write(p []byte) (int, error) {
 
 	// The following is effectively an io.Multiwriter, but without updating
 	// the Multiwriter each time tmpWriter is added or removed.
-	if _, err := w.innerWriter.Write(p); err != nil {
-		return 0, err
+	if !w.suppressInner {
+		if _, err := w.innerWriter.Write(p); err != nil {
+			return 0, err
+		}
 	}
 
 	if w.lokiWriter != nil {

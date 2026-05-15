@@ -72,7 +72,7 @@ func TestSlogTester(t *testing.T) {
 		}
 		return ms
 	}
-	err = slogtest.TestHandler(l.handler, results)
+	err = slogtest.TestHandler(l.bytesHandler, results)
 	require.NoError(t, err)
 }
 
@@ -89,7 +89,7 @@ func getTestHandler(t *testing.T, w io.Writer) slog.Handler {
 	})
 	require.NoError(t, err)
 
-	return l.handler
+	return l.bytesHandler
 }
 
 // testReplace is used for unit tests so we can ensure the time and source fields are consistent.
@@ -120,7 +120,7 @@ func newDeferredTest(w io.Writer) (*Logger, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.handler.replacer = testReplace
+	l.bytesHandler.replacer = testReplace
 
 	return l, nil
 }
