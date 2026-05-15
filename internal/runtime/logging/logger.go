@@ -23,8 +23,6 @@ type EnabledAware interface {
 // Logger is the logging subsystem of Alloy. It supports being dynamically
 // updated at runtime.
 type Logger struct {
-	inner io.Writer // Writer passed to New.
-
 	bufferMut    sync.RWMutex
 	buffer       []*bufferedItem // Store logs before correctly determine the log format
 	hasLogFormat bool            // Confirmation whether log format has been determined
@@ -90,8 +88,6 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 	writer := &writerVar{innerWriter: w}
 
 	l := &Logger{
-		inner: w,
-
 		buffer:       []*bufferedItem{},
 		hasLogFormat: false,
 
