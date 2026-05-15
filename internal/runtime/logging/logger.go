@@ -310,6 +310,18 @@ func (w *writerVar) SetSuppressInner(b bool) {
 	w.suppressInner = b
 }
 
+// HasSink reports whether any active sink will actually consume bytes
+// written to this writerVar. Used by bytesHandler.Handle to skip formatting
+// entirely when every sink would silently drop the result (destination=none
+// with no write_to and no temporary writer attached).
+func (w *writerVar) HasSink() bool {
+	w.mut.RLock()
+	defer w.mut.RUnlock()
+	return (w.innerWriter != nil && !w.suppressInner) ||
+		w.lokiWriter != nil ||
+		w.tmpWriter != nil
+}
+
 func (w *writerVar) Write(p []byte) (int, error) {
 	w.mut.RLock()
 	defer w.mut.RUnlock()
