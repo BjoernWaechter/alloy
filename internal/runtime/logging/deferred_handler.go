@@ -90,7 +90,7 @@ func (d *deferredSlogHandler) buildHandlers(parent slog.Handler) {
 
 	// Root node will not have attrs or groups.
 	if parent == nil {
-		d.handle = d.l.handler
+		d.handle = d.l.bytesHandler
 	} else {
 		if d.group != "" {
 			d.handle = parent.WithGroup(d.group)

@@ -27,28 +27,26 @@ type Logger struct {
 	buffer       []*bufferedItem // Store logs before correctly determine the log format
 	hasLogFormat bool            // Confirmation whether log format has been determined
 
-	level        *slog.LevelVar       // Current configured level.
-	format       *formatVar           // Current configured format.
-	writer       *writerVar           // Current configured multiwriter (inner + write_to).
-	bytesHandler *bytesHandler        // slog.Handler that formats records to bytes and writes through writer.
-	deferredSlog *deferredSlogHandler // Buffers slog output until config is loaded, then delegates to handler.
+	level  *slog.LevelVar // Current configured level.
+	format *formatVar     // Current configured format.
+	writer *writerVar     // Current configured multiwriter (inner + write_to + event log).
 
-	windowsEventLogHandler *windowsEventLogHandler // When destination is windows_event_log (Windows only).
-	eventLogOpener         eventlog.EventLogOpener // Opens the Windows event log; set in NewDeferred, overridable via SetEventLogOpener for tests.
+	// bytesHandler is the single slog.Handler dispatched to by both the
+	// gokit and slog paths. It is set once in NewDeferred and never
+	// reassigned. Its writer (a *writerVar) owns every sink, including
+	// the optional Windows Event Log; Update toggles state on writerVar
+	// rather than swapping handlers.
+	bytesHandler *bytesHandler
+	deferredSlog *deferredSlogHandler // Buffers slog output until config is loaded, then delegates to bytesHandler.
 
-	// handler is the slog.Handler dispatched to by both the gokit and slog
-	// paths. It is a stable fanoutHandler{windowsEventLogHandler, bytesHandler}
-	// set once in NewDeferred and never reassigned. The two children carry
-	// their own enable/disable state with drain-on-disable semantics so
-	// Update can flip destinations without losing any in-flight record.
-	handler slog.Handler
+	eventLogOpener eventlog.EventLogOpener // Opens the Windows event log; set in NewDeferred, overridable in tests.
 }
 
 var _ EnabledAware = (*Logger)(nil)
 
 // Enabled implements EnabledAware interface.
 func (l *Logger) Enabled(ctx context.Context, level slog.Level) bool {
-	return l.handler.Enabled(ctx, level)
+	return l.bytesHandler.Enabled(ctx, level)
 }
 
 // New creates a New logger with the default log level and format.
@@ -86,26 +84,23 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 	// want to suppress it (windows_event_log) flip writerVar.suppressInner
 	// instead of swapping the writer.
 	writer := &writerVar{innerWriter: w}
+	bh := &bytesHandler{
+		w:         writer,
+		leveler:   &leveler,
+		formatter: &format,
+		replacer:  replace,
+	}
 
 	l := &Logger{
 		buffer:       []*bufferedItem{},
 		hasLogFormat: false,
 
-		level:  &leveler,
-		format: &format,
-		writer: writer,
-		bytesHandler: &bytesHandler{
-			w:         writer,
-			leveler:   &leveler,
-			formatter: &format,
-			replacer:  replace,
-		},
+		level:          &leveler,
+		format:         &format,
+		writer:         writer,
+		bytesHandler:   bh,
 		eventLogOpener: eventlog.GetEventLogOpener(),
 	}
-	// The handler structure is stable for the life of the Logger; Update
-	// flips state on the children rather than reassigning l.handler.
-	l.windowsEventLogHandler = newWindowsEventLogHandler(l.level, replace)
-	l.handler = fanoutHandler{a: l.windowsEventLogHandler, b: l.bytesHandler}
 	l.deferredSlog = newDeferredHandler(l)
 
 	return l, nil
@@ -159,47 +154,40 @@ func (l *Logger) Update(o Options) error {
 	return nil
 }
 
-// applyDestination toggles state on the (stable) child handlers to match
-// the new destination. Must be called with l.bufferMut held by the caller.
+// applyDestination toggles state on l.writer to match the new destination.
+// Must be called with l.bufferMut held by the caller.
 //
 // The architecture is loss-free by construction:
-//   - l.handler is a stable fanout over windowsEventLogHandler and
-//     bytesHandler — Update never reassigns it.
-//   - Each child carries its own state behind a sync.RWMutex with
-//     drain-on-disable semantics. Handle/Write take RLock; the mutators
-//     (Close, SetSuppressInner) take Lock so they wait for in-flight calls
-//     to finish before flipping state.
+//   - l.handler is the stable bytesHandler — Update never reassigns it.
+//   - l.writer owns every sink (stderr, write_to, tmp, event log) and
+//     each mutator (SetSuppressInner, SetEventLog, CloseEventLog) takes
+//     the write lock, draining any in-flight Write/WriteRecord before
+//     flipping state. In-flight Logs always finish against the
+//     configuration that was active when they started.
 //
-// Every in-flight Log dispatch therefore completes against the
-// configuration that was active when it started, and never observes a
-// closed handle or a half-changed writer.
-//
-// Adding a future "none" destination: extend the suppress condition to
-// cover it — one line.
+// Adding a future "none" destination: extend the suppress condition
+// below so it also covers `none` — one line.
 func (l *Logger) applyDestination(d LogDestination) error {
 	willHaveEventLog := d == LogDestinationWindowsEventLog
 
-	if willHaveEventLog && !l.windowsEventLogHandler.IsOpen() {
-		el, err := l.eventLogOpener("Alloy")
-		if err != nil {
-			return fmt.Errorf("failed to open Windows Event Log: %w", err)
-		}
-		l.windowsEventLogHandler.SetEventLog(el)
-	}
-
 	if willHaveEventLog {
-		// Order: open event log first (above) so by the time we suppress
-		// inner, the event log path is already accepting records.
+		// Open the event log lazily on the first event_log Update.
+		// Subsequent event_log → event_log reloads reuse the handle.
+		if _, hasEL := l.writer.FastPathFlags(); !hasEL {
+			el, err := l.eventLogOpener("Alloy")
+			if err != nil {
+				return fmt.Errorf("failed to open Windows Event Log: %w", err)
+			}
+			l.writer.SetEventLog(el)
+		}
 		l.writer.SetSuppressInner(true)
 	} else {
-		// Order: unsuppress first so in-flight Logs that were in event_log
-		// mode and now race past SetSuppressInner deliver to stderr; then
-		// close the event log (which drains any in-flight event-log
-		// dispatches before releasing the OS handle).
+		// Unsuppress first so in-flight Logs that were in event_log mode
+		// can still deliver bytes to stderr via writerVar; then close the
+		// event log (Close drains any in-flight WriteRecord calls before
+		// releasing the OS handle).
 		l.writer.SetSuppressInner(false)
-		if l.windowsEventLogHandler.IsOpen() {
-			_ = l.windowsEventLogHandler.Close()
-		}
+		_ = l.writer.CloseEventLog()
 	}
 	return nil
 }
@@ -222,7 +210,7 @@ func (l *Logger) flushBuffer() {
 
 	for _, item := range buffer {
 		if len(item.kvps) > 0 {
-			slogadapter.GoKit(l.handler).Log(item.kvps...)
+			slogadapter.GoKit(l.bytesHandler).Log(item.kvps...)
 		} else if item.handler.Enabled(context.Background(), item.record.Level) {
 			_ = item.handler.Handle(context.Background(), item.record)
 		}
@@ -257,7 +245,7 @@ func (l *Logger) Log(kvps ...any) error {
 
 	// NOTE(rfratto): slogadapter is a temporary shim while log/slog is still
 	// being adopted throughout the codebase.
-	return slogadapter.GoKit(l.handler).Log(kvps...)
+	return slogadapter.GoKit(l.bytesHandler).Log(kvps...)
 }
 
 func (l *Logger) addRecord(r slog.Record, df *deferredSlogHandler) {
@@ -324,6 +312,13 @@ type writerVar struct {
 	innerWriter   io.Writer
 	tmpWriter     io.Writer
 	suppressInner bool // when true, Write skips innerWriter
+
+	// eventLog is the optional Windows Event Log sink. When non-nil,
+	// WriteRecord additionally maps the record's level to Info/Warning/Error
+	// and forwards the formatted bytes. Protected by mut so concurrent
+	// Write/WriteRecord calls drain before CloseEventLog releases the OS
+	// handle.
+	eventLog eventlog.EventLog
 }
 
 func (w *writerVar) SetTemporaryWriter(writer io.Writer) {
@@ -354,46 +349,113 @@ func (w *writerVar) SetSuppressInner(b bool) {
 	w.suppressInner = b
 }
 
-// HasSink reports whether any active sink will actually consume bytes
-// written to this writerVar. Used by bytesHandler.Handle to skip formatting
-// entirely when every sink would silently drop the result (event_log
-// destination with no write_to and no temporary writer attached).
-func (w *writerVar) HasSink() bool {
-	w.mut.RLock()
-	defer w.mut.RUnlock()
-	return (w.innerWriter != nil && !w.suppressInner) ||
-		w.lokiWriter != nil ||
-		w.tmpWriter != nil
+// SetEventLog installs the Windows Event Log sink. Subsequent calls to
+// WriteRecord forward records to el with the level mapped to
+// Info/Warning/Error.
+func (w *writerVar) SetEventLog(el eventlog.EventLog) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	w.eventLog = el
 }
 
-func (w *writerVar) Write(p []byte) (int, error) {
+// CloseEventLog closes and detaches the Windows Event Log sink. Takes the
+// write lock, so it waits for any in-flight WriteRecord/Write calls to
+// finish before releasing the underlying OS handle. Idempotent.
+func (w *writerVar) CloseEventLog() error {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	if w.eventLog == nil {
+		return nil
+	}
+	err := w.eventLog.Close()
+	w.eventLog = nil
+	return err
+}
+
+// FastPathFlags returns whether any sink is active and whether the event
+// log sink in particular is attached. Both checks happen under a single
+// RLock so callers see a consistent snapshot. Used by bytesHandler.Handle
+// to decide between the fast path (no buffer; direct slog handler write
+// to writerVar) and the slow path (capture bytes + dispatch with level).
+//
+// io.Discard is treated as "no sink": tests and benchmarks pass it as
+// the underlying writer when they want to measure the logger path
+// without actually consuming bytes, and the bytes handler should skip
+// formatting in that case.
+func (w *writerVar) FastPathFlags() (hasSink, hasEventLog bool) {
+	w.mut.RLock()
+	defer w.mut.RUnlock()
+	hasEventLog = w.eventLog != nil
+	hasSink = hasEventLog ||
+		(w.innerWriter != nil && w.innerWriter != io.Discard && !w.suppressInner) ||
+		w.lokiWriter != nil ||
+		w.tmpWriter != nil
+	return
+}
+
+// HasSink reports whether any active sink will accept bytes. Kept for
+// callers that don't need to distinguish the event-log case.
+func (w *writerVar) HasSink() bool {
+	hasSink, _ := w.FastPathFlags()
+	return hasSink
+}
+
+// Dispatch is the canonical write entry point. It fans p out to every
+// active byte-stream sink (innerWriter unless suppressed/nil, lokiWriter,
+// tmpWriter). If eventLogLevel is non-nil and an event log is attached, p
+// is also forwarded to the event log with the level mapped to
+// Info/Warning/Error.
+//
+// The trailing newline added by slog's TextHandler/JSONHandler is trimmed
+// before handing the message to the event log API, which renders cleaner
+// in Event Viewer.
+//
+// A nil eventLogLevel is the only way to skip the event log explicitly —
+// passing slog.Level(0) would dispatch as Info, because zero is a valid
+// slog.Level.
+func (w *writerVar) Dispatch(p []byte, eventLogLevel *slog.Level) error {
 	w.mut.RLock()
 	defer w.mut.RUnlock()
 
-	if w.innerWriter == nil {
-		return 0, fmt.Errorf("no writer available")
-	}
-
-	// The following is effectively an io.Multiwriter, but without updating
-	// the Multiwriter each time tmpWriter is added or removed.
-	if !w.suppressInner {
+	if !w.suppressInner && w.innerWriter != nil {
 		if _, err := w.innerWriter.Write(p); err != nil {
-			return 0, err
+			return err
 		}
 	}
-
 	if w.lokiWriter != nil {
 		if _, err := w.lokiWriter.Write(p); err != nil {
-			return 0, err
+			return err
 		}
 	}
-
 	if w.tmpWriter != nil {
 		if _, err := w.tmpWriter.Write(p); err != nil {
-			return 0, err
+			return err
 		}
 	}
+	if eventLogLevel == nil || w.eventLog == nil {
+		return nil
+	}
+	msg := p
+	if n := len(msg); n > 0 && msg[n-1] == '\n' {
+		msg = msg[:n-1]
+	}
+	switch *eventLogLevel {
+	case slog.LevelWarn:
+		return w.eventLog.Warning(1, string(msg))
+	case slog.LevelError:
+		return w.eventLog.Error(1, string(msg))
+	default:
+		return w.eventLog.Info(1, string(msg))
+	}
+}
 
+// Write is the io.Writer adapter used by the fast-path slog handler.
+// Equivalent to Dispatch(p, nil) — byte-stream sinks only, no event log.
+// For the event-log path use Dispatch directly with a non-nil level.
+func (w *writerVar) Write(p []byte) (int, error) {
+	if err := w.Dispatch(p, nil); err != nil {
+		return 0, err
+	}
 	return len(p), nil
 }
 
