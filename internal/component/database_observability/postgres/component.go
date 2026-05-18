@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/lib/pq"
@@ -252,8 +251,8 @@ type Component struct {
 	openSQL                func(driverName, dataSourceName string) (*sql.DB, error)
 	logsReceiver           loki.LogsReceiver
 	exporterCollectors     []prometheus.Collector
-	logTimezone            stdatomic.Pointer[time.Location]
-	lastLogTimezoneWarning stdatomic.Pointer[string] // dedupes the unparseable-log_timezone warning across refresh ticks
+	logTimezone            atomic.Pointer[time.Location]
+	lastLogTimezoneWarning atomic.Pointer[string] // dedupes the unparseable-log_timezone warning across refresh ticks
 }
 
 func New(opts component.Options, args Arguments) (*Component, error) {
