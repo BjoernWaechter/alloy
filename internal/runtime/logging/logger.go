@@ -31,13 +31,13 @@ type Logger struct {
 	format *formatVar     // Current configured format.
 	writer *writerVar     // Current configured multiwriter (inner + write_to + event log).
 
-	// bytesHandler is the single slog.Handler dispatched to by both the
+	// handler is the single slog.Handler dispatched to by both the
 	// gokit and slog paths. It is set once in NewDeferred and never
 	// reassigned. Its writer (a *writerVar) owns every sink, including
 	// the optional Windows Event Log; Update toggles state on writerVar
 	// rather than swapping handlers.
-	bytesHandler *bytesHandler
-	deferredSlog *deferredSlogHandler // Buffers slog output until config is loaded, then delegates to bytesHandler.
+	handler      *handler
+	deferredSlog *deferredSlogHandler // Buffers slog output until config is loaded, then delegates to handler.
 
 	eventLogOpener eventlog.EventLogOpener // Opens the Windows event log; set in NewDeferred, overridable in tests.
 }
@@ -46,7 +46,7 @@ var _ EnabledAware = (*Logger)(nil)
 
 // Enabled implements EnabledAware interface.
 func (l *Logger) Enabled(ctx context.Context, level slog.Level) bool {
-	return l.bytesHandler.Enabled(ctx, level)
+	return l.handler.Enabled(ctx, level)
 }
 
 // New creates a New logger with the default log level and format.
@@ -84,7 +84,7 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 	// want to suppress it (windows_event_log) flip writerVar.suppressInner
 	// instead of swapping the writer.
 	writer := &writerVar{innerWriter: w}
-	bh := &bytesHandler{
+	bh := &handler{
 		w:         writer,
 		leveler:   &leveler,
 		formatter: &format,
@@ -98,7 +98,7 @@ func NewDeferred(w io.Writer) (*Logger, error) {
 		level:          &leveler,
 		format:         &format,
 		writer:         writer,
-		bytesHandler:   bh,
+		handler:        bh,
 		eventLogOpener: eventlog.GetEventLogOpener(),
 	}
 	l.deferredSlog = newDeferredHandler(l)
@@ -158,7 +158,7 @@ func (l *Logger) Update(o Options) error {
 // Must be called with l.bufferMut held by the caller.
 //
 // The architecture is loss-free by construction:
-//   - l.handler is the stable bytesHandler — Update never reassigns it.
+//   - l.handler is stable — Update never reassigns it.
 //   - l.writer owns every sink (stderr, write_to, tmp, event log) and
 //     each mutator (SetSuppressInner, SetEventLog, CloseEventLog) takes
 //     the write lock, draining any in-flight Write/WriteRecord before
@@ -210,7 +210,7 @@ func (l *Logger) flushBuffer() {
 
 	for _, item := range buffer {
 		if len(item.kvps) > 0 {
-			slogadapter.GoKit(l.bytesHandler).Log(item.kvps...)
+			slogadapter.GoKit(l.handler).Log(item.kvps...)
 		} else if item.handler.Enabled(context.Background(), item.record.Level) {
 			_ = item.handler.Handle(context.Background(), item.record)
 		}
@@ -245,7 +245,7 @@ func (l *Logger) Log(kvps ...any) error {
 
 	// NOTE(rfratto): slogadapter is a temporary shim while log/slog is still
 	// being adopted throughout the codebase.
-	return slogadapter.GoKit(l.bytesHandler).Log(kvps...)
+	return slogadapter.GoKit(l.handler).Log(kvps...)
 }
 
 func (l *Logger) addRecord(r slog.Record, df *deferredSlogHandler) {
@@ -374,7 +374,7 @@ func (w *writerVar) CloseEventLog() error {
 
 // FastPathFlags returns whether any sink is active and whether the event
 // log sink in particular is attached. Both checks happen under a single
-// RLock so callers see a consistent snapshot. Used by bytesHandler.Handle
+// RLock so callers see a consistent snapshot. Used by handler.Handle
 // to decide between the fast path (no buffer; direct slog handler write
 // to writerVar) and the slow path (capture bytes + dispatch with level).
 //

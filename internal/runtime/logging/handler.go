@@ -22,7 +22,7 @@ import (
 // expected to behave. Handlers will look up whether they should be logging as
 // JSON or logfmt, and create a new inner handler if needed.
 
-type bytesHandler struct {
+type handler struct {
 	// w owns every sink (innerWriter, lokiWriter, tmpWriter, and the
 	// optional event log). It also implements io.Writer so it can be
 	// passed straight into slog.NewTextHandler/JSONHandler on the fast
@@ -50,14 +50,14 @@ type formatter interface {
 	Format() Format
 }
 
-var _ slog.Handler = (*bytesHandler)(nil)
+var _ slog.Handler = (*handler)(nil)
 
-func (h *bytesHandler) Enabled(ctx context.Context, l slog.Level) bool {
+func (h *handler) Enabled(ctx context.Context, l slog.Level) bool {
 	// Bypass the cache and check the underlying leveler directly.
 	return l >= h.leveler.Level()
 }
 
-func (h *bytesHandler) Handle(ctx context.Context, r slog.Record) error {
+func (h *handler) Handle(ctx context.Context, r slog.Record) error {
 	hasSink, hasEventLog := h.w.FastPathFlags()
 	if !hasSink {
 		// Skip formatting entirely when no sink is listening — the slog
@@ -80,7 +80,7 @@ func (h *bytesHandler) Handle(ctx context.Context, r slog.Record) error {
 // freshly-built slog handler, then dispatches via writerVar.WriteRecord
 // which knows about the event log and the record level. Only used when
 // the event log destination is active.
-func (h *bytesHandler) handleWithEventLog(ctx context.Context, r slog.Record) error {
+func (h *handler) handleWithEventLog(ctx context.Context, r slog.Record) error {
 	// Cheap level filter before we allocate the buffer and build the
 	// per-call slog handler. The inner slog handler filters too, but doing
 	// it here also skips the event-log dispatch (which would otherwise
@@ -112,7 +112,7 @@ var bytesPool = sync.Pool{
 // current format and the WithAttrs/WithGroup chain applied. Used by both
 // buildHandler (which caches the result for the fast path) and the
 // event-log slow path (which can't cache because the writer is per-call).
-func (h *bytesHandler) newSlogHandler(w io.Writer) slog.Handler {
+func (h *handler) newSlogHandler(w io.Writer) slog.Handler {
 	handlerOpts := slog.HandlerOptions{
 		AddSource: false,
 		Level:     h.leveler,
@@ -143,7 +143,7 @@ func (h *bytesHandler) newSlogHandler(w io.Writer) slog.Handler {
 // buildHandler returns a cached slog handler bound to h.w. Used by the
 // fast path (no event log) so each Log call avoids the cost of
 // reconstructing the WithAttrs/WithGroup chain.
-func (h *bytesHandler) buildHandler() slog.Handler {
+func (h *handler) buildHandler() slog.Handler {
 	// Get the expected format for the duration of this call. It's possible
 	// that this will be stale by the time the call returns, but it will be
 	// correct on the next call.
@@ -165,14 +165,14 @@ func (h *bytesHandler) buildHandler() slog.Handler {
 	return h.inner
 }
 
-func (h *bytesHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+func (h *handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	newNest := make([]nesting, 0, len(h.nested)+1)
 	newNest = append(newNest, h.nested...)
 	newNest = append(newNest, nesting{
 		attrs: attrs,
 	})
 
-	return &bytesHandler{
+	return &handler{
 		w:         h.w,
 		leveler:   h.leveler,
 		formatter: h.formatter,
@@ -182,13 +182,13 @@ func (h *bytesHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
-func (h *bytesHandler) WithGroup(name string) slog.Handler {
+func (h *handler) WithGroup(name string) slog.Handler {
 	newNest := make([]nesting, 0, len(h.nested)+1)
 	newNest = append(newNest, h.nested...)
 	newNest = append(newNest, nesting{
 		group: name,
 	})
-	return &bytesHandler{
+	return &handler{
 		w:         h.w,
 		leveler:   h.leveler,
 		formatter: h.formatter,

@@ -15,7 +15,7 @@ import (
 // log level on an event_log → event_log reload actually propagates to
 // the event-log dispatch path. The event log doesn't have its own slog
 // handler anymore — formatting and level filtering both go through the
-// bytesHandler — so this exercises that the bytesHandler's leveler is
+// shared handler — so this exercises that the handler's leveler is
 // the live one Update mutates.
 func TestLogger_EventLog_LevelReloadTakesEffect(t *testing.T) {
 	mock := &testutil.MockEventLog{}
@@ -60,7 +60,7 @@ func TestLogger_EventLog_LevelReloadTakesEffect(t *testing.T) {
 }
 
 // TestLogger_EventLog_RespectsFormatChoice is the whole point of routing
-// the event log through bytesHandler: the message that lands in the
+// the event log through the shared handler: the message that lands in the
 // Windows Event Log is the same formatted line that goes to stderr/
 // write_to, so logfmt → logfmt, json → json. Operators with log
 // forwarders parsing the event log get parseable output.
